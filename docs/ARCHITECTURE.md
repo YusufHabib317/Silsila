@@ -541,10 +541,15 @@ QR; toggle the network → backoff messages then `connected`.
 `wa_auth_key` tables, Postgres-backed Baileys auth state, connection manager with
 backoff.*
 
-### Phase 1 — Persist the raw layer
+### Phase 1 — Persist the raw layer (STARTED)
 Write `contacts`, `chats`, `chat_participants`, `messages`, `media` (metadata).
 Stand up the NestJS API. Basic dashboard list + Postgres full-text search. This
 alone is already useful.
+
+*Delivered so far: raw archive entities + migration, live message persistence,
+dedupe on `(account_id, wa_message_id)`, contact/chat normalization, and skipped
+media metadata rows. Remaining: API, dashboard list, and Postgres full-text
+search.*
 
 ### Phase 2 — Scale & media pipeline
 Multiple numbers, robust reconnection, BullMQ queue, R2 media pipeline with image

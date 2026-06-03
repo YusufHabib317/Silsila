@@ -1,6 +1,7 @@
 import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
+  proto,
   WASocket,
 } from 'baileys'
 import qrcode from 'qrcode-terminal'
@@ -8,6 +9,7 @@ import { DataSource } from 'typeorm'
 import { WaSession } from '@wa/entities'
 import { useDbAuthState } from './db-auth-state'
 import { baileysLogger, logger } from './logger'
+import { persistRawMessages } from './raw-archive'
 
 const BASE_DELAY_MS = 2_000
 const MAX_DELAY_MS = 60_000
@@ -54,8 +56,18 @@ export class WaConnection {
     this.sock.ev.on('connection.update', (u) => this.onConnectionUpdate(u))
     this.sock.ev.on('messages.upsert', ({ messages, type }) => {
       if (type !== 'notify') return // ignore history backfill, only live msgs
-      for (const msg of messages) this.logMessage(msg)
+      void this.onMessages(messages)
     })
+  }
+
+  private async onMessages(messages: proto.IWebMessageInfo[]): Promise<void> {
+    for (const msg of messages) this.logMessage(msg)
+    try {
+      const stored = await persistRawMessages(this.dataSource, this.sessionId, messages)
+      if (stored > 0) logger.info(`[${this.sessionId}] archived ${stored} message(s)`)
+    } catch (e) {
+      logger.error(e)
+    }
   }
 
   private async onConnectionUpdate(update: any): Promise<void> {

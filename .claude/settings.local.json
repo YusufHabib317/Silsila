@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e \"console.log\\('baileys ->', require.resolve\\('baileys'\\)\\); console.log\\('typeorm ->', require.resolve\\('typeorm'\\)\\);\")",
+      "Bash(node \"node_modules/.pnpm/typescript@5.9.3/node_modules/typescript/lib/tsc.js\" -p apps/worker/tsconfig.json --noEmit)",
+      "Bash(node \"node_modules/.pnpm/typescript@5.9.3/node_modules/typescript/lib/tsc.js\" -p packages/entities/tsconfig.json --noEmit)"
+    ]
+  }
+}

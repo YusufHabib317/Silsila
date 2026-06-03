@@ -1,0 +1,7 @@
+# Database is Neon (cloud) — no local Postgres needed.
+# Redis stays for the queue layer added in a later phase.
+services:
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"

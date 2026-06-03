@@ -1,0 +1,10 @@
+{
+  "name": "wa-dashboard",
+  "private": true,
+  "packageManager": "pnpm@9.0.0",
+  "scripts": {
+    "worker:dev": "pnpm --filter @wa/worker dev",
+    "migration:run": "pnpm --filter @wa/entities migration:run",
+    "migration:revert": "pnpm --filter @wa/entities migration:revert"
+  }
+}

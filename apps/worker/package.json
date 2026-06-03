@@ -1,0 +1,26 @@
+{
+  "name": "@wa/worker",
+  "version": "0.0.0",
+  "private": true,
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "node --watch -r ts-node/register/transpile-only src/index.ts",
+    "start": "node -r ts-node/register/transpile-only src/index.ts"
+  },
+  "dependencies": {
+    "@wa/entities": "workspace:*",
+    "baileys": "^6.7.0",
+    "qrcode-terminal": "^0.12.0",
+    "pino": "^9.0.0",
+    "typeorm": "^0.3.20",
+    "reflect-metadata": "^0.2.2",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "ts-node": "^10.9.2",
+    "pino-pretty": "^11.0.0",
+    "typescript": "^5.4.5",
+    "@types/node": "^20.12.0",
+    "@types/qrcode-terminal": "^0.12.2"
+  }
+}

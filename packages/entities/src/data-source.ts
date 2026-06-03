@@ -12,9 +12,16 @@ import { AccountChat } from './entities/account-chat.entity'
 import { ChatParticipant } from './entities/chat-participant.entity'
 import { ArchivedMessage } from './entities/archived-message.entity'
 import { Media } from './entities/media.entity'
+import { Tag } from './entities/tag.entity'
+import { ContactTag } from './entities/contact-tag.entity'
+import { Transaction } from './entities/transaction.entity'
+import { TransactionMessage } from './entities/transaction-message.entity'
+import { TransactionStatusHistory } from './entities/transaction-status-history.entity'
+import { Payment } from './entities/payment.entity'
 import { InitWaAuth1700000000000 } from './migrations/1700000000000-InitWaAuth'
 import { CreateRawArchive1700000001000 } from './migrations/1700000001000-CreateRawArchive'
 import { Phase2MediaPipeline1700000002000 } from './migrations/1700000002000-Phase2MediaPipeline'
+import { Phase3Tracking1700000003000 } from './migrations/1700000003000-Phase3Tracking'
 
 // Load the monorepo-root .env explicitly. dotenv's default looks in process.cwd(),
 // but `pnpm --filter` runs these scripts with cwd set to this package dir, so the
@@ -35,11 +42,27 @@ export const AppDataSource = new DataSource({
   driver: neon,
   url: process.env.DATABASE_URL,
   ssl: useSsl ? { rejectUnauthorized: false } : false,
-  entities: [Account, WaAuthKey, Contact, Chat, AccountChat, ChatParticipant, ArchivedMessage, Media],
+  entities: [
+    Account,
+    WaAuthKey,
+    Contact,
+    Chat,
+    AccountChat,
+    ChatParticipant,
+    ArchivedMessage,
+    Media,
+    Tag,
+    ContactTag,
+    Transaction,
+    TransactionMessage,
+    TransactionStatusHistory,
+    Payment,
+  ],
   migrations: [
     InitWaAuth1700000000000,
     CreateRawArchive1700000001000,
     Phase2MediaPipeline1700000002000,
+    Phase3Tracking1700000003000,
   ],
   // NEVER turn this on in production — it silently alters your tables.
   // We use explicit migrations instead.

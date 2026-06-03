@@ -1,4 +1,5 @@
 import 'reflect-metadata'
+import { randomUUID } from 'node:crypto'
 import { createReadStream, existsSync } from 'node:fs'
 import { extname, join, normalize } from 'node:path'
 import { createServer, IncomingMessage, ServerResponse } from 'node:http'
@@ -16,6 +17,13 @@ const WA_EVENTS_CHANNEL = 'wa:events'
 // Connected dashboard SSE clients; the Redis subscriber fans events out to them.
 const sseClients = new Set<ServerResponse>()
 
+const MESSAGE_STATUSES = ['pending', 'stored', 'skipped', 'failed'] as const
+const TRANSACTION_STATUSES = ['draft', 'pending', 'in_transit', 'completed', 'refunded', 'lost', 'cancelled'] as const
+const TERMINAL_TRANSACTION_STATUSES = new Set(['completed', 'refunded', 'lost', 'cancelled'])
+const DIRECTION_VALUES = ['incoming', 'outgoing'] as const
+const TAG_KINDS = ['role', 'custom'] as const
+const PAYMENT_DIRECTIONS = ['incoming', 'outgoing'] as const
+
 type MessageRow = {
   id: string
   wa_message_id: string
@@ -24,6 +32,7 @@ type MessageRow = {
   type: string
   text: string | null
   from_me: boolean
+  sender_contact_id: string | null
   chat_wa_jid: string
   chat_type: string
   chat_subject: string | null
@@ -33,15 +42,53 @@ type MessageRow = {
   media: { id: string; type: string; storage_status: string }[]
 }
 
-// Subscribe to worker-published live events and push them to all SSE clients.
-function startEventSubscriber() {
-  const url = process.env.REDIS_URL || 'redis://localhost:6379'
-  const sub = new IORedis(url, { maxRetriesPerRequest: null })
-  sub.on('message', (_channel: string, payload: string) => {
-    for (const res of sseClients) res.write(`data: ${payload}\n\n`)
-  })
-  sub.on('error', (e: Error) => console.error('redis subscriber error:', e.message))
-  sub.subscribe(WA_EVENTS_CHANNEL).catch((e: unknown) => console.error('redis subscribe failed:', e))
+type TransactionRow = {
+  id: string
+  from_contact_id: string
+  to_contact_id: string
+  direction: string
+  product_text: string | null
+  quantity: string | null
+  amount: string
+  currency: string
+  status: string
+  opened_at: string | null
+  closed_at: string | null
+  created_at: string
+  updated_at: string
+  payments_count: string
+  from_contact_wa_jid: string
+  to_contact_wa_jid: string
+  linked_messages: string
+  notes: string | null
+}
+
+type TransactionMessageRow = {
+  message_id: string
+  wa_message_id: string
+  account_id: string
+  timestamp: string | null
+  type: string
+  text: string | null
+}
+
+type TransactionStatusHistoryRow = {
+  id: string
+  from_status: string | null
+  to_status: string
+  changed_by_user_id: string | null
+  note: string | null
+  changed_at: string
+}
+
+type PaymentRow = {
+  id: string
+  amount: string
+  currency: string
+  direction: string
+  method: string | null
+  paid_at: string
+  note: string | null
 }
 
 async function main() {
@@ -71,46 +118,245 @@ async function main() {
   process.on('SIGTERM', shutdown)
 }
 
+// Subscribe to worker-published live events and push them to all SSE clients.
+function startEventSubscriber() {
+  const url = process.env.REDIS_URL || 'redis://localhost:6379'
+  const sub = new IORedis(url, { maxRetriesPerRequest: null })
+  sub.on('message', (_channel: string, payload: string) => {
+    for (const res of sseClients) res.write(`data: ${payload}\n\n`)
+  })
+  sub.on('error', (e: Error) => console.error('redis subscriber error:', e.message))
+  sub.subscribe(WA_EVENTS_CHANNEL).catch((e: unknown) => console.error('redis subscribe failed:', e))
+}
+
+function isOneOf<T extends string>(value: string, allowed: readonly T[]): value is T {
+  return allowed.includes(value as T)
+}
+
+function validateStatus(status: string): status is (typeof TRANSACTION_STATUSES)[number] {
+  return isOneOf(status, TRANSACTION_STATUSES)
+}
+
+function validateDirection(direction: string): direction is (typeof DIRECTION_VALUES)[number] {
+  return isOneOf(direction, DIRECTION_VALUES)
+}
+
+function validateTagKind(kind: string): kind is (typeof TAG_KINDS)[number] {
+  return isOneOf(kind, TAG_KINDS)
+}
+
+function toErrorCode(e: unknown): { code: number; error: string } {
+  if (e instanceof Error) {
+    if (e.message === 'not_found') return { code: 404, error: 'not_found' }
+    if (e.message.startsWith('validation_error:')) {
+      return { code: 400, error: e.message.replace('validation_error:', '') }
+    }
+  }
+  return { code: 500, error: 'internal_error' }
+}
+
 async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
+  try {
+    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
+    const method = req.method ?? 'GET'
 
-  if (url.pathname === '/api/health') {
-    sendJson(res, 200, { ok: true })
+    if (url.pathname === '/api/health') {
+      sendJson(res, 200, { ok: true })
+      return
+    }
+
+    if (url.pathname === '/api/stats') {
+      if (method !== 'GET') {
+        sendJson(res, 405, { error: 'method_not_allowed' })
+        return
+      }
+      sendJson(res, 200, await getStats())
+      return
+    }
+
+    if (url.pathname === '/api/messages') {
+      if (method !== 'GET') {
+        sendJson(res, 405, { error: 'method_not_allowed' })
+        return
+      }
+      sendJson(res, 200, await getMessages(url))
+      return
+    }
+
+    if (url.pathname === '/api/chats') {
+      if (method !== 'GET') {
+        sendJson(res, 405, { error: 'method_not_allowed' })
+        return
+      }
+      sendJson(res, 200, await getChats())
+      return
+    }
+
+    if (url.pathname === '/api/stream') {
+      if (method !== 'GET') {
+        sendJson(res, 405, { error: 'method_not_allowed' })
+        return
+      }
+      handleStream(req, res)
+      return
+    }
+
+    if (url.pathname.startsWith('/api/media/')) {
+      if (method !== 'GET') {
+        sendJson(res, 405, { error: 'method_not_allowed' })
+        return
+      }
+      await handleMedia(decodeURIComponent(url.pathname.slice('/api/media/'.length)), res)
+      return
+    }
+
+    if (url.pathname.startsWith('/api/transactions')) {
+      await handleTransactions(req, res, url, method)
+      return
+    }
+
+    if (url.pathname === '/api/tags') {
+      if (method === 'GET') {
+        sendJson(res, 200, await getTags())
+        return
+      }
+      if (method === 'POST') {
+        const payload = await readJsonBody(req)
+        sendJson(res, 201, await createTag(payload))
+        return
+      }
+      sendJson(res, 405, { error: 'method_not_allowed' })
+      return
+    }
+
+    if (url.pathname.startsWith('/api/contacts/')) {
+      await handleContactRoutes(req, res, url, method)
+      return
+    }
+
+    if (url.pathname === '/favicon.ico') {
+      res.statusCode = 204
+      res.end()
+      return
+    }
+
+    await serveStatic(url.pathname, res)
+  } catch (err) {
+    const mapped = toErrorCode(err)
+    if (mapped.code === 500) {
+      console.error(err)
+    }
+    sendJson(res, mapped.code, { error: mapped.error })
+  }
+}
+
+async function handleTransactions(req: IncomingMessage, res: ServerResponse, url: URL, method: string): Promise<void> {
+  if (url.pathname === '/api/transactions') {
+    if (method === 'GET') {
+      sendJson(res, 200, await getTransactions(url))
+      return
+    }
+    if (method === 'POST') {
+      const payload = await readJsonBody(req)
+      sendJson(res, 201, await createTransaction(payload))
+      return
+    }
+    sendJson(res, 405, { error: 'method_not_allowed' })
     return
   }
 
-  if (url.pathname === '/api/stats') {
-    sendJson(res, 200, await getStats())
+  const parts = url.pathname.split('/').filter(Boolean)
+  const id = parts[2] ?? ''
+  if (!id) {
+    sendJson(res, 404, { error: 'not_found' })
     return
   }
 
-  if (url.pathname === '/api/messages') {
-    sendJson(res, 200, await getMessages(url))
+  const action = parts[3]
+  if (!action) {
+    if (method !== 'GET') {
+      sendJson(res, 405, { error: 'method_not_allowed' })
+      return
+    }
+    sendJson(res, 200, await getTransactionById(id))
     return
   }
 
-  if (url.pathname === '/api/chats') {
-    sendJson(res, 200, await getChats())
+  if (action === 'messages') {
+    if (method !== 'POST') {
+      sendJson(res, 405, { error: 'method_not_allowed' })
+      return
+    }
+    const payload = await readJsonBody(req)
+    sendJson(res, 201, await linkMessageToTransaction(id, payload))
     return
   }
 
-  if (url.pathname === '/api/stream') {
-    handleStream(req, res)
+  if (action === 'payments') {
+    if (method === 'GET') {
+      sendJson(res, 200, await getPaymentsByTransaction(id))
+      return
+    }
+    if (method === 'POST') {
+      const payload = await readJsonBody(req)
+      sendJson(res, 201, await createPayment(id, payload))
+      return
+    }
+    sendJson(res, 405, { error: 'method_not_allowed' })
     return
   }
 
-  if (url.pathname.startsWith('/api/media/')) {
-    await handleMedia(decodeURIComponent(url.pathname.slice('/api/media/'.length)), res)
+  if (action === 'status') {
+    if (method !== 'POST') {
+      sendJson(res, 405, { error: 'method_not_allowed' })
+      return
+    }
+    const payload = await readJsonBody(req)
+    sendJson(res, 200, await updateTransactionStatus(id, payload))
     return
   }
 
-  if (url.pathname === '/favicon.ico') {
-    res.statusCode = 204
-    res.end()
+  sendJson(res, 404, { error: 'not_found' })
+}
+
+async function handleContactRoutes(req: IncomingMessage, res: ServerResponse, url: URL, method: string): Promise<void> {
+  const parts = url.pathname.split('/').filter(Boolean)
+  if (parts.length < 4) {
+    sendJson(res, 404, { error: 'not_found' })
     return
   }
 
-  await serveStatic(url.pathname, res)
+  const contactId = parts[2]
+  const action = parts[3]
+  if (action !== 'tags') {
+    sendJson(res, 404, { error: 'not_found' })
+    return
+  }
+
+  if (method === 'GET') {
+    sendJson(res, 200, await getContactTags(contactId))
+    return
+  }
+
+  if (method === 'POST') {
+    const payload = await readJsonBody(req)
+    sendJson(res, 201, await addContactTag(contactId, payload))
+    return
+  }
+
+  sendJson(res, 405, { error: 'method_not_allowed' })
+}
+
+async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = []
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)))
+  }
+
+  if (chunks.length === 0) return {}
+  const raw = Buffer.concat(chunks).toString('utf8').trim()
+  if (!raw) return {}
+  return JSON.parse(raw)
 }
 
 // SSE: hold the connection open, register it, and let the Redis subscriber push
@@ -131,38 +377,14 @@ function handleStream(req: IncomingMessage, res: ServerResponse): void {
   })
 }
 
-// Redirect to a short-lived presigned R2 URL so the browser fetches media directly
-// from R2 (zero egress). Only `stored` media has an object to serve.
-async function handleMedia(id: string, res: ServerResponse): Promise<void> {
-  const [row] = await AppDataSource.query(
-    `select storage_status, r2_key from media where id = $1`,
-    [id],
-  )
-  if (!row) {
-    sendJson(res, 404, { error: 'not_found' })
-    return
-  }
-  if (row.storage_status !== 'stored' || !row.r2_key) {
-    sendJson(res, 409, { status: row.storage_status })
-    return
-  }
-  if (!storage.isEnabled) {
-    sendJson(res, 503, { error: 'storage_disabled' })
-    return
-  }
-  const signed = await storage.getSignedUrl(row.r2_key, 300)
-  res.statusCode = 302
-  res.setHeader('location', signed)
-  res.end()
-}
-
 async function getStats() {
   const [counts] = await AppDataSource.query(`
     select
       (select count(*)::int from messages) as messages,
       (select count(*)::int from chats) as chats,
       (select count(*)::int from contacts) as contacts,
-      (select count(*)::int from media) as media
+      (select count(*)::int from media) as media,
+      (select count(*)::int from transactions) as transactions
   `)
 
   const recent = await AppDataSource.query(`
@@ -226,6 +448,7 @@ async function getMessages(url: URL) {
         m.type,
         m.text,
         m.from_me,
+        m.sender_contact_id,
         c.wa_jid as chat_wa_jid,
         c.type as chat_type,
         c.subject as chat_subject,
@@ -282,6 +505,496 @@ async function getChats() {
   `)
 
   return { rows }
+}
+
+async function handleMedia(id: string, res: ServerResponse): Promise<void> {
+  const [row] = await AppDataSource.query(
+    `select storage_status, r2_key from media where id = $1`,
+    [id],
+  )
+  if (!row) {
+    sendJson(res, 404, { error: 'not_found' })
+    return
+  }
+  if (row.storage_status !== 'stored' || !row.r2_key) {
+    sendJson(res, 409, { status: row.storage_status })
+    return
+  }
+  if (!storage.isEnabled) {
+    sendJson(res, 503, { error: 'storage_disabled' })
+    return
+  }
+  const signed = await storage.getSignedUrl(row.r2_key, 300)
+  res.statusCode = 302
+  res.setHeader('location', signed)
+  res.end()
+}
+
+async function getTransactions(url: URL) {
+  const rawLimit = Number(url.searchParams.get('limit') ?? 50)
+  const rawOffset = Number(url.searchParams.get('offset') ?? 0)
+  const status = (url.searchParams.get('status') ?? '').trim()
+  const q = (url.searchParams.get('q') ?? '').trim()
+
+  const limit = Math.min(Math.max(rawLimit, 1), 100)
+  const offset = Math.max(rawOffset, 0)
+
+  const filters: unknown[] = []
+  const where: string[] = []
+
+  if (status && isOneOf(status, TRANSACTION_STATUSES)) {
+    filters.push(status)
+    where.push(`t.status = $${filters.length}`)
+  }
+
+  if (q) {
+    filters.push(`%${q}%`)
+    const idx = filters.length
+    where.push(`(
+      t.product_text ilike $${idx} or
+      coalesce(t.notes, '') ilike $${idx} or
+      fc.wa_jid ilike $${idx} or
+      tc.wa_jid ilike $${idx} or
+      t.currency ilike $${idx}
+    )`)
+  }
+
+  const whereSql = where.length ? `where ${where.join(' and ')}` : ''
+  const rows = (await AppDataSource.query(
+    `
+      select
+        t.id,
+        t.from_contact_id,
+        t.to_contact_id,
+        t.direction,
+        t.product_text,
+        t.quantity::text as quantity,
+        t.amount::text as amount,
+        t.currency,
+        t.status,
+        t.opened_at,
+        t.closed_at,
+        t.notes,
+        t.created_at,
+        t.updated_at,
+        fc.wa_jid as from_contact_wa_jid,
+        tc.wa_jid as to_contact_wa_jid,
+        count(distinct tm.message_id)::int as linked_messages,
+        count(distinct p.id)::int as payments_count
+      from transactions t
+      join contacts fc on fc.id = t.from_contact_id
+      join contacts tc on tc.id = t.to_contact_id
+      left join transaction_messages tm on tm.transaction_id = t.id
+      left join payments p on p.transaction_id = t.id
+      ${whereSql}
+      group by t.id, fc.wa_jid, tc.wa_jid
+      order by t.updated_at desc nulls last, t.created_at desc
+      limit $${filters.length + 1}
+      offset $${filters.length + 2}
+    `,
+    [...filters, limit, offset],
+  )) as TransactionRow[]
+
+  const [{ total }] = await AppDataSource.query(
+    `
+      select count(*)::int as total
+      from transactions t
+      join contacts fc on fc.id = t.from_contact_id
+      join contacts tc on tc.id = t.to_contact_id
+      ${whereSql}
+    `,
+    filters,
+  )
+
+  return { rows, total, limit, offset }
+}
+
+async function getTransactionById(id: string) {
+  const [row] = await AppDataSource.query(
+    `
+      select
+        t.id,
+        t.from_contact_id,
+        t.to_contact_id,
+        t.direction,
+        t.product_text,
+        t.quantity::text as quantity,
+        t.amount::text as amount,
+        t.currency,
+        t.status,
+        t.opened_at,
+        t.closed_at,
+        t.notes,
+        t.created_at,
+        t.updated_at,
+        fc.wa_jid as from_contact_wa_jid,
+        tc.wa_jid as to_contact_wa_jid
+      from transactions t
+      join contacts fc on fc.id = t.from_contact_id
+      join contacts tc on tc.id = t.to_contact_id
+      where t.id = $1
+    `,
+    [id],
+  )
+  if (!row) throw new Error('not_found')
+
+  const messageRows = (await AppDataSource.query(
+    `
+      select
+        tm.message_id,
+        m.wa_message_id,
+        m.account_id,
+        m.timestamp,
+        m.type,
+        m.text
+      from transaction_messages tm
+      join messages m on m.id = tm.message_id
+      where tm.transaction_id = $1
+      order by m.timestamp desc nulls last
+    `,
+    [id],
+  )) as TransactionMessageRow[]
+
+  const history = (await AppDataSource.query(
+    `
+      select
+        id,
+        from_status,
+        to_status,
+        changed_by_user_id,
+        note,
+        changed_at
+      from transaction_status_history
+      where transaction_id = $1
+      order by changed_at asc
+    `,
+    [id],
+  )) as TransactionStatusHistoryRow[]
+
+  const payments = (await AppDataSource.query(
+    `
+      select
+        id,
+        amount::text as amount,
+        currency,
+        direction,
+        method,
+        paid_at,
+        note
+      from payments
+      where transaction_id = $1
+      order by paid_at desc
+    `,
+    [id],
+  )) as PaymentRow[]
+
+  return { ...row, message_rows: messageRows, history, payments }
+}
+
+async function createTransaction(payload: unknown) {
+  const body = (payload ?? {}) as Record<string, unknown>
+  const direction = String(body.direction ?? '').trim()
+  const productText = body.productText ?? body.product_text
+  const fromWaJid = body.fromContactWaJid ?? body.from_contact_wa_jid
+  const toWaJid = body.toContactWaJid ?? body.to_contact_wa_jid
+  const fromContactId = await resolveContactId(body.fromContactId, fromWaJid)
+  const toContactId = await resolveContactId(body.toContactId, toWaJid)
+  const currency = String(body.currency ?? 'USD').trim().toUpperCase()
+  const rawStatus = String(body.status ?? 'draft')
+  const status = isOneOf(rawStatus, TRANSACTION_STATUSES) ? rawStatus : 'draft'
+  const quantity = normalizeNumeric(body.quantity)
+  const amount = normalizeNumeric(body.amount)
+  const notes = typeof body.notes === 'string' && body.notes.trim() ? body.notes.trim() : null
+  const changedByUserId = typeof body.changedByUserId === 'string' ? body.changedByUserId : null
+
+  if (!validateDirection(direction)) throw new Error('validation_error:direction')
+  if (!fromContactId) throw new Error('validation_error:fromContactId')
+  if (!toContactId) throw new Error('validation_error:toContactId')
+  if (!amount) throw new Error('validation_error:amount')
+  if (!currency) throw new Error('validation_error:currency')
+  if (!isOneOf(currency, ['SYP', 'USD'])) throw new Error('validation_error:currency')
+
+  const id = randomUUID()
+  const openedAt = status === 'draft' ? null : new Date()
+
+  await AppDataSource.query(
+    `
+      insert into transactions (
+        id, from_contact_id, to_contact_id, direction, product_text, quantity, amount,
+        currency, status, opened_by_user_id, opened_at, notes
+      ) values (
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12
+      )
+    `,
+    [
+      id,
+      fromContactId,
+      toContactId,
+      direction,
+      productText ?? null,
+      quantity,
+      amount,
+      currency,
+      status,
+      changedByUserId,
+      openedAt,
+      notes,
+    ],
+  )
+
+  await AppDataSource.query(
+    `
+      insert into transaction_status_history (id, transaction_id, from_status, to_status, changed_by_user_id, note, changed_at)
+      values ($1, $2, null, $3, $4, $5, now())
+    `,
+    [randomUUID(), id, status, changedByUserId, body.note ?? null],
+  )
+
+  return getTransactionById(id)
+}
+
+async function linkMessageToTransaction(transactionId: string, payload: unknown) {
+  const body = (payload ?? {}) as Record<string, unknown>
+  const messageId = String(body.messageId ?? body.message_id ?? '')
+
+  if (!messageId) throw new Error('validation_error:messageId')
+
+  const [transaction] = await AppDataSource.query(`select id from transactions where id = $1`, [transactionId])
+  if (!transaction) throw new Error('not_found')
+  const [message] = await AppDataSource.query(`select id from messages where id = $1`, [messageId])
+  if (!message) throw new Error('validation_error:message_not_found')
+
+  await AppDataSource.query(
+    `
+      insert into transaction_messages (transaction_id, message_id)
+      values ($1, $2)
+      on conflict (transaction_id, message_id) do nothing
+    `,
+    [transactionId, messageId],
+  )
+
+  return { ok: true, transaction_id: transactionId, message_id: messageId }
+}
+
+async function updateTransactionStatus(transactionId: string, payload: unknown) {
+  const body = (payload ?? {}) as Record<string, unknown>
+  const rawStatus = String(body.status ?? '')
+  if (!validateStatus(rawStatus)) throw new Error('validation_error:status')
+
+  const note = typeof body.note === 'string' ? body.note.trim() : null
+  const changedByUserId = typeof body.changedByUserId === 'string' ? body.changedByUserId : null
+
+  const [current] = await AppDataSource.query(`select status from transactions where id = $1`, [transactionId])
+  if (!current) throw new Error('not_found')
+  if (current.status === rawStatus) return getTransactionById(transactionId)
+
+  const shouldSetOpenedAt = current.status === 'draft' && rawStatus !== 'draft'
+  const closedAt = TERMINAL_TRANSACTION_STATUSES.has(rawStatus) ? new Date() : null
+
+  await AppDataSource.query(
+    `
+      update transactions
+      set status = $1,
+          updated_at = now(),
+          opened_at = CASE WHEN $3 = true AND opened_at IS NULL THEN now() ELSE opened_at END,
+          closed_at = $4::timestamptz
+      where id = $2
+    `,
+    [rawStatus, transactionId, shouldSetOpenedAt, closedAt],
+  )
+
+  await AppDataSource.query(
+    `
+      insert into transaction_status_history (
+        id, transaction_id, from_status, to_status, changed_by_user_id, note, changed_at
+      ) values ($1, $2, $3, $4, $5, $6, now())
+    `,
+    [randomUUID(), transactionId, current.status, rawStatus, changedByUserId, note],
+  )
+
+  return getTransactionById(transactionId)
+}
+
+async function getTags() {
+  const rows = await AppDataSource.query(`
+    select id, name, kind, color
+    from tags
+    order by lower(name), kind
+  `)
+  return { rows }
+}
+
+async function createTag(payload: unknown) {
+  const body = (payload ?? {}) as Record<string, unknown>
+  const name = String(body.name ?? '').trim()
+  const kind = String(body.kind ?? 'custom').trim()
+  const color = typeof body.color === 'string' ? body.color.trim() : null
+
+  if (!name) throw new Error('validation_error:name')
+  if (!validateTagKind(kind)) throw new Error('validation_error:kind')
+
+  const existing = await AppDataSource.query(
+    `select id, name, kind, color from tags where lower(name) = lower($1) and kind = $2`,
+    [name, kind],
+  )
+  if (existing.length > 0) {
+    return existing[0]
+  }
+
+  const id = randomUUID()
+  await AppDataSource.query(
+    `insert into tags (id, name, kind, color) values ($1, $2, $3, $4)`,
+    [id, name, kind, color],
+  )
+  return { id, name, kind, color }
+}
+
+async function getPaymentsByTransaction(transactionId: string) {
+  const [transaction] = await AppDataSource.query(`select id from transactions where id = $1`, [transactionId])
+  if (!transaction) throw new Error('not_found')
+
+  const rows = (await AppDataSource.query(
+    `
+      select
+        id,
+        amount::text as amount,
+        currency,
+        direction,
+        method,
+        paid_at,
+        note
+      from payments
+      where transaction_id = $1
+      order by paid_at desc
+    `,
+    [transactionId],
+  )) as PaymentRow[]
+
+  return { rows, total: rows.length }
+}
+
+async function createPayment(transactionId: string, payload: unknown) {
+  const body = (payload ?? {}) as Record<string, unknown>
+  const amount = normalizeNumeric(body.amount)
+  const currency = String(body.currency ?? 'USD').trim().toUpperCase()
+  const rawDirection = String(body.direction ?? '').trim()
+  const direction = isOneOf(rawDirection, PAYMENT_DIRECTIONS) ? rawDirection : ''
+  const method = typeof body.method === 'string' && body.method.trim() ? body.method.trim() : null
+  const note = typeof body.note === 'string' && body.note.trim() ? body.note.trim() : null
+  const rawPaidAt = typeof body.paidAt === 'string' ? body.paidAt.trim() : ''
+  const paidAt = rawPaidAt ? new Date(rawPaidAt) : new Date()
+
+  if (!amount) throw new Error('validation_error:amount')
+  if (!isOneOf(currency, ['SYP', 'USD'])) throw new Error('validation_error:currency')
+  if (!direction) throw new Error('validation_error:direction')
+  if (Number.isNaN(paidAt.getTime())) throw new Error('validation_error:paidAt')
+
+  const [transaction] = await AppDataSource.query(`select id from transactions where id = $1`, [transactionId])
+  if (!transaction) throw new Error('not_found')
+
+  const id = randomUUID()
+  await AppDataSource.query(
+    `
+      insert into payments (
+        id, transaction_id, amount, currency, direction, method, paid_at, note
+      ) values ($1, $2, $3, $4, $5, $6, $7, $8)
+    `,
+    [id, transactionId, amount, currency, direction, method, paidAt, note],
+  )
+
+  const [payment] = (await AppDataSource.query(
+    `
+      select
+        id,
+        amount::text as amount,
+        currency,
+        direction,
+        method,
+        paid_at,
+        note
+      from payments
+      where id = $1
+    `,
+    [id],
+  )) as PaymentRow[]
+
+  return payment
+}
+
+async function getContactTags(contactId: string) {
+  const [contact] = await AppDataSource.query(`select id from contacts where id = $1`, [contactId])
+  if (!contact) throw new Error('not_found')
+
+  const rows = await AppDataSource.query(
+    `
+      select t.id, t.name, t.kind, t.color
+      from tags t
+      join contact_tags ct on ct.tag_id = t.id
+      where ct.contact_id = $1
+      order by t.kind, t.name
+    `,
+    [contactId],
+  )
+
+  return { rows }
+}
+
+async function addContactTag(contactId: string, payload: unknown) {
+  const body = (payload ?? {}) as Record<string, unknown>
+  const requestedTagId = typeof body.tagId === 'string' ? body.tagId.trim() : ''
+
+  const [contact] = await AppDataSource.query(`select id from contacts where id = $1`, [contactId])
+  if (!contact) throw new Error('not_found')
+
+  let tagId = requestedTagId
+  if (!tagId) {
+    const name = String(body.name ?? '').trim()
+    const kind = String(body.kind ?? 'custom').trim()
+    const color = typeof body.color === 'string' ? body.color.trim() : null
+
+    if (!name) throw new Error('validation_error:tagId')
+    if (!validateTagKind(kind)) throw new Error('validation_error:kind')
+
+    const existing = await AppDataSource.query(
+      `select id from tags where lower(name) = lower($1) and kind = $2`,
+      [name, kind],
+    )
+    if (existing.length > 0) {
+      tagId = existing[0].id
+    } else {
+      tagId = randomUUID()
+      await AppDataSource.query(`insert into tags (id, name, kind, color) values ($1, $2, $3, $4)`, [
+        tagId,
+        name,
+        kind,
+        color,
+      ])
+    }
+  }
+
+  await AppDataSource.query(
+    `insert into contact_tags (contact_id, tag_id) values ($1, $2) on conflict (contact_id, tag_id) do nothing`,
+    [contactId, tagId],
+  )
+
+  const [row] = await AppDataSource.query(`select id, name, kind, color from tags where id = $1`, [tagId])
+  return row
+}
+
+async function resolveContactId(contactId: unknown, waJid: unknown): Promise<string | null> {
+  if (typeof contactId === 'string' && contactId.trim()) return contactId.trim()
+  if (typeof waJid === 'string' && waJid.trim()) {
+    const [row] = await AppDataSource.query(`select id from contacts where wa_jid = $1`, [waJid.trim()])
+    return row ? row.id : null
+  }
+  return null
+}
+
+function normalizeNumeric(value: unknown): string | null {
+  if (value == null) return null
+  if (typeof value === 'number') return Number.isFinite(value) ? String(value) : null
+  if (typeof value === 'string') return value.trim() ? value.trim() : null
+  return null
 }
 
 async function serveStatic(pathname: string, res: ServerResponse): Promise<void> {

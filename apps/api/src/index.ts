@@ -23,6 +23,15 @@ const TERMINAL_TRANSACTION_STATUSES = new Set(['completed', 'refunded', 'lost', 
 const DIRECTION_VALUES = ['incoming', 'outgoing'] as const
 const TAG_KINDS = ['role', 'custom'] as const
 const PAYMENT_DIRECTIONS = ['incoming', 'outgoing'] as const
+const ALERT_RULE_KINDS = ['keyword', 'stale_pending', 'no_movement'] as const
+const ALERT_SEVERITIES = ['info', 'warning', 'critical'] as const
+const ALARM_EVAL_INTERVAL_MS = Number.parseInt(process.env.ALERT_EVAL_INTERVAL_MS ?? '60000', 10)
+const MEILISEARCH_URL = process.env.MEILISEARCH_URL ?? ''
+const MEILISEARCH_API_KEY = process.env.MEILISEARCH_API_KEY ?? ''
+const MEILISEARCH_INDEX = process.env.MEILISEARCH_MESSAGES_INDEX ?? 'messages'
+const ALERT_EVAL_INTERVAL_MS = Number.isFinite(ALARM_EVAL_INTERVAL_MS) && ALARM_EVAL_INTERVAL_MS >= 10_000
+  ? ALARM_EVAL_INTERVAL_MS
+  : 60_000
 
 type MessageRow = {
   id: string
@@ -40,6 +49,29 @@ type MessageRow = {
   sender_name: string | null
   media_count: string
   media: { id: string; type: string; storage_status: string }[]
+}
+
+type AlertRuleRow = {
+  id: string
+  name: string
+  kind: string
+  params: Record<string, unknown>
+  thresholdMinutes: number | null
+  cooldownMinutes: number
+  enabled: boolean
+}
+
+type AlertNotificationRow = {
+  id: string
+  alertRuleId: string
+  entityType: string
+  entityId: string
+  severity: string
+  title: string
+  details: Record<string, unknown>
+  isRead: boolean
+  createdAt: string
+  alertRuleName?: string
 }
 
 type TransactionRow = {
@@ -95,6 +127,7 @@ async function main() {
   await AppDataSource.initialize()
   console.log('database connected')
   startEventSubscriber()
+  startAlertEngine()
 
   const server = createServer((req, res) => {
     void route(req, res).catch((e) => {
@@ -123,10 +156,27 @@ function startEventSubscriber() {
   const url = process.env.REDIS_URL || 'redis://localhost:6379'
   const sub = new IORedis(url, { maxRetriesPerRequest: null })
   sub.on('message', (_channel: string, payload: string) => {
-    for (const res of sseClients) res.write(`data: ${payload}\n\n`)
+    publishSseEventRaw(payload)
   })
   sub.on('error', (e: Error) => console.error('redis subscriber error:', e.message))
   sub.subscribe(WA_EVENTS_CHANNEL).catch((e: unknown) => console.error('redis subscribe failed:', e))
+}
+
+function startAlertEngine() {
+  void evaluateAlerts().catch((e) => console.error('alert eval error:', e))
+  setInterval(() => {
+    void evaluateAlerts().catch((e) => console.error('alert eval error:', e))
+  }, ALERT_EVAL_INTERVAL_MS)
+}
+
+function publishSseEvent(payload: unknown) {
+  publishSseEventRaw(JSON.stringify(payload))
+}
+
+function publishSseEventRaw(payload: string) {
+  for (const res of sseClients) {
+    res.write(`data: ${payload}\n\n`)
+  }
 }
 
 function isOneOf<T extends string>(value: string, allowed: readonly T[]): value is T {
@@ -171,6 +221,25 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
         return
       }
       sendJson(res, 200, await getStats())
+      return
+    }
+
+    if (url.pathname === '/api/alert-rules') {
+      if (method === 'GET') {
+        sendJson(res, 200, await getAlertRules())
+        return
+      }
+      if (method === 'POST') {
+        const payload = await readJsonBody(req)
+        sendJson(res, 201, await createAlertRule(payload))
+        return
+      }
+      sendJson(res, 405, { error: 'method_not_allowed' })
+      return
+    }
+
+    if (url.pathname.startsWith('/api/alerts')) {
+      await handleAlertsRoutes(req, res, url, method)
       return
     }
 
@@ -384,7 +453,30 @@ async function getStats() {
       (select count(*)::int from chats) as chats,
       (select count(*)::int from contacts) as contacts,
       (select count(*)::int from media) as media,
-      (select count(*)::int from transactions) as transactions
+      (select count(*)::int from transactions) as transactions,
+      (select count(*)::int from transactions where status = 'pending') as pending_transactions,
+      (select count(*)::int from messages where timestamp >= now() - interval '24 hours') as messages_last_24h,
+      (select count(*)::int from messages where timestamp >= now() - interval '7 days') as messages_last_7d,
+      (select count(*)::int from transactions where updated_at >= now() - interval '24 hours') as transactions_updated_last_24h,
+      (select count(*)::int from notifications where is_read = false) as unread_alerts,
+      (select count(*)::int from notifications where is_read = false and severity = 'critical') as critical_alerts,
+      (
+        select coalesce(jsonb_object_agg(status, count), '{}'::jsonb)
+        from (
+          select t.status, count(*)::int as count
+          from transactions t
+          group by t.status
+        ) t
+      ) as transactions_by_status,
+      (
+        select coalesce(jsonb_object_agg(severity, count), '{}'::jsonb)
+        from (
+          select n.severity, count(*)::int as count
+          from notifications n
+          where n.is_read = false
+          group by n.severity
+        ) n
+      ) as alerts_by_severity
   `)
 
   const recent = await AppDataSource.query(`
@@ -411,6 +503,13 @@ async function getMessages(url: URL) {
   const offset = Math.max(rawOffset, 0)
   const q = (url.searchParams.get('q') ?? '').trim()
   const chat = (url.searchParams.get('chat') ?? '').trim()
+
+  if (q && MEILISEARCH_URL) {
+    const byMeili = await searchMessagesWithMeilisearch(q, chat, limit, offset)
+    if (byMeili) {
+      return byMeili
+    }
+  }
 
   const where: string[] = []
   const params: unknown[] = []
@@ -505,6 +604,488 @@ async function getChats() {
   `)
 
   return { rows }
+}
+
+async function handleAlertsRoutes(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  method: string,
+): Promise<void> {
+  const parts = url.pathname.split('/').filter(Boolean)
+  const topLevel = parts[1]
+  if (topLevel !== 'alerts') {
+    sendJson(res, 404, { error: 'not_found' })
+    return
+  }
+
+  if (parts.length === 2) {
+    if (method !== 'GET') {
+      sendJson(res, 405, { error: 'method_not_allowed' })
+      return
+    }
+    sendJson(res, 200, await getNotifications(url))
+    return
+  }
+
+  const action = parts[2]
+  if (parts.length === 3 && action && method === 'GET') {
+    sendJson(res, 404, { error: 'not_found' })
+    return
+  }
+
+  if (action && url.pathname.endsWith('/ack') && method === 'POST') {
+    const [, , alertId] = parts
+    if (!alertId) {
+      sendJson(res, 404, { error: 'not_found' })
+      return
+    }
+    sendJson(res, 200, await ackNotification(alertId))
+    return
+  }
+  if (action && url.pathname.endsWith('/ack')) {
+    sendJson(res, 405, { error: 'method_not_allowed' })
+    return
+  }
+
+  sendJson(res, 404, { error: 'not_found' })
+}
+
+async function getNotifications(url: URL) {
+  const rawLimit = Number(url.searchParams.get('limit') ?? 25)
+  const rawOffset = Number(url.searchParams.get('offset') ?? 0)
+  const unreadOnly = (url.searchParams.get('unread') ?? 'true') !== 'false'
+  const entityType = (url.searchParams.get('entityType') ?? '').trim()
+  const ruleKind = (url.searchParams.get('kind') ?? '').trim()
+  const limit = Math.min(Math.max(rawLimit, 1), 100)
+  const offset = Math.max(rawOffset, 0)
+
+  const where: string[] = []
+  const params: unknown[] = []
+
+  if (unreadOnly) {
+    where.push('n.is_read = false')
+  }
+  if (entityType) {
+    params.push(entityType)
+    where.push(`n.entity_type = $${params.length}`)
+  }
+  if (ruleKind) {
+    params.push(ruleKind)
+    where.push(`ar.kind = $${params.length}`)
+  }
+
+  const whereSql = where.length ? `where ${where.join(' and ')}` : ''
+
+  params.push(limit, offset)
+  const limitParam = params.length - 1
+  const offsetParam = params.length
+  const rows = (await AppDataSource.query(
+    `
+      select
+        n.id,
+        n.alert_rule_id as "alertRuleId",
+        n.entity_type as "entityType",
+        n.entity_id as "entityId",
+        n.severity,
+        n.title,
+        n.details,
+        n.is_read as "isRead",
+        n.created_at as "createdAt",
+        ar.name as "alertRuleName"
+      from notifications n
+      join alert_rules ar on ar.id = n.alert_rule_id
+      ${whereSql}
+      order by n.created_at desc
+      limit $${limitParam}
+      offset $${offsetParam}
+    `,
+    params,
+  )) as AlertNotificationRow[]
+
+  const countParams = params.slice(0, params.length - 2)
+  const [{ total }] = await AppDataSource.query(
+    `
+      select count(*)::int as total
+      from notifications n
+      join alert_rules ar on ar.id = n.alert_rule_id
+      ${whereSql}
+    `,
+    countParams,
+  )
+
+  return { rows, total, limit, offset }
+}
+
+async function ackNotification(id: string) {
+  const [row] = (await AppDataSource.query(
+    `
+      update notifications
+      set is_read = true, read_at = now()
+      where id = $1
+      returning id, is_read
+    `,
+    [id],
+  )) as { id: string; is_read: boolean }[]
+  if (!row) throw new Error('not_found')
+  return row
+}
+
+async function getAlertRules() {
+  const rows = (await AppDataSource.query(
+    `select id, name, kind, params, threshold_minutes as "thresholdMinutes", cooldown_minutes as "cooldownMinutes", enabled, created_at, updated_at from alert_rules order by created_at desc`,
+  )) as AlertRuleRow[]
+  return { rows }
+}
+
+function parseAlertRuleKind(kind: string): (typeof ALERT_RULE_KINDS)[number] | null {
+  return isOneOf(kind, ALERT_RULE_KINDS) ? kind : null
+}
+
+async function createAlertRule(payload: unknown) {
+  const body = (payload ?? {}) as Record<string, unknown>
+  const name = String(body.name ?? '').trim() || 'Untitled rule'
+  const rawKind = String(body.kind ?? '').trim()
+  const kind = parseAlertRuleKind(rawKind)
+  const thresholdMinutes = normalizePositiveInteger(body.thresholdMinutes ?? body.threshold_minutes, 60)
+  const cooldownMinutes = normalizePositiveInteger(body.cooldownMinutes ?? body.cooldown_minutes, 30)
+  const rawParams = (body.params ?? {}) as Record<string, unknown>
+
+  if (!kind) throw new Error('validation_error:kind')
+  if (!name) throw new Error('validation_error:name')
+
+  const params = buildRuleParams(kind, rawParams, body)
+  const id = randomUUID()
+
+  await AppDataSource.query(
+    `
+      insert into alert_rules (
+        id, name, kind, params, threshold_minutes, cooldown_minutes, enabled
+      ) values ($1, $2, $3, $4, $5, $6, $7)
+    `,
+    [id, name, kind, params, thresholdMinutes, cooldownMinutes, body.enabled !== false],
+  )
+
+  const [row] = (await AppDataSource.query(
+    `
+      select
+        id, name, kind, params,
+        threshold_minutes as "thresholdMinutes",
+        cooldown_minutes as "cooldownMinutes",
+        enabled,
+        created_at,
+        updated_at
+      from alert_rules
+      where id = $1
+    `,
+    [id],
+  )) as AlertRuleRow[]
+
+  return row
+}
+
+function buildRuleParams(
+  kind: (typeof ALERT_RULE_KINDS)[number],
+  rawParams: Record<string, unknown>,
+  body: Record<string, unknown>,
+): Record<string, unknown> {
+  const params: Record<string, unknown> = {
+    ...rawParams,
+  }
+  if (kind === 'keyword') {
+    const keyword = String(rawParams.keyword ?? body.keyword ?? '').trim()
+    if (!keyword) {
+      throw new Error('validation_error:keyword')
+    }
+    params.keyword = keyword
+  }
+  return params
+}
+
+async function evaluateAlerts() {
+  if (evaluateAlertsRunning) return
+  evaluateAlertsRunning = true
+
+  try {
+    const rules = (await AppDataSource.query(
+      `
+        select
+          id, name, kind, params,
+          threshold_minutes as "thresholdMinutes",
+          cooldown_minutes as "cooldownMinutes",
+          enabled
+        from alert_rules
+        where enabled = true
+      `,
+    )) as AlertRuleRow[]
+
+    for (const rule of rules) {
+      const entityType = rule.kind === 'keyword' ? 'message' : 'transaction'
+      const cooldown = rule.cooldownMinutes || 60
+      if (rule.kind === 'keyword') {
+        await evaluateKeywordRule(rule, cooldown, entityType)
+        continue
+      }
+      if (rule.kind === 'stale_pending') {
+        await evaluateStalePendingRule(rule, cooldown, entityType)
+        continue
+      }
+      await evaluateNoMovementRule(rule, cooldown, entityType)
+    }
+  } finally {
+    evaluateAlertsRunning = false
+  }
+}
+
+async function evaluateKeywordRule(rule: AlertRuleRow, cooldownMinutes: number, entityType: string) {
+  const keyword = String((rule.params as Record<string, unknown>).keyword ?? '').trim()
+  if (!keyword) return
+  const matchedMessages = (await AppDataSource.query(
+    `
+      select m.id, c.wa_jid as chatWaJid
+      from messages m
+      join chats c on c.id = m.chat_id
+      where coalesce(m.text, '') ilike '%' || $1 || '%'
+      order by m.created_at desc
+      limit 100
+    `,
+    [keyword],
+  )) as { id: string; chatWaJid: string }[]
+
+  for (const msg of matchedMessages) {
+    const isRecent = await hasRecentNotification(rule.id, entityType, msg.id, cooldownMinutes)
+    if (isRecent) continue
+
+    await createNotification(rule, {
+      alertEntityType: entityType,
+      alertEntityId: msg.id,
+      severity: 'info',
+      title: `Keyword match: ${rule.name}`,
+      details: { keyword, chatWaJid: msg.chatWaJid },
+    })
+  }
+}
+
+async function evaluateStalePendingRule(rule: AlertRuleRow, cooldownMinutes: number, entityType: string) {
+  const thresholdMinutes = rule.thresholdMinutes ?? 60
+  const staleTransactions = (await AppDataSource.query(
+    `
+      select t.id, t.opened_at
+      from transactions t
+      where t.status = 'pending'
+        and t.opened_at is not null
+        and t.opened_at < now() - $1::interval
+      order by opened_at asc
+      limit 100
+    `,
+    [`${thresholdMinutes} minutes`],
+  )) as { id: string; openedAt: string }[]
+
+  for (const tx of staleTransactions) {
+    const isRecent = await hasRecentNotification(rule.id, entityType, tx.id, cooldownMinutes)
+    if (isRecent) continue
+
+    await createNotification(rule, {
+      alertEntityType: entityType,
+      alertEntityId: tx.id,
+      severity: 'warning',
+      title: `Stale pending transaction ${rule.name}`,
+      details: { transactionId: tx.id, openedAt: tx.openedAt },
+    })
+  }
+}
+
+async function evaluateNoMovementRule(rule: AlertRuleRow, cooldownMinutes: number, entityType: string) {
+  const thresholdMinutes = rule.thresholdMinutes ?? 120
+  const transactions = (await AppDataSource.query(
+    `
+      select t.id, COALESCE(h.changed_at, t.created_at) as lastStatusAt
+      from transactions t
+      left join LATERAL (
+        select changed_at
+        from transaction_status_history
+        where transaction_id = t.id
+        order by changed_at desc
+        limit 1
+      ) h on true
+      where t.status not in ('completed', 'refunded', 'lost', 'cancelled')
+        and COALESCE(h.changed_at, t.created_at) < now() - $1::interval
+      order by lastStatusAt asc
+      limit 100
+    `,
+    [`${thresholdMinutes} minutes`],
+  )) as { id: string; lastStatusAt: string }[]
+
+  for (const tx of transactions) {
+    const isRecent = await hasRecentNotification(rule.id, entityType, tx.id, cooldownMinutes)
+    if (isRecent) continue
+
+    await createNotification(rule, {
+      alertEntityType: entityType,
+      alertEntityId: tx.id,
+      severity: 'warning',
+      title: `No movement: ${rule.name}`,
+      details: { transactionId: tx.id, lastStatusAt: tx.lastStatusAt },
+    })
+  }
+}
+
+async function hasRecentNotification(ruleId: string, entityType: string, entityId: string, cooldownMinutes: number) {
+  const [row] = (await AppDataSource.query(
+    `
+      select 1
+      from notifications
+      where alert_rule_id = $1
+        and entity_type = $2
+        and entity_id = $3
+        and is_read = false
+        and created_at > now() - $4::interval
+      limit 1
+    `,
+    [ruleId, entityType, entityId, `${cooldownMinutes} minutes`],
+  )) as { one?: number }[]
+
+  return !!row
+}
+
+async function createNotification(
+  rule: AlertRuleRow,
+  options: {
+    alertEntityType: string
+    alertEntityId: string
+    severity: (typeof ALERT_SEVERITIES)[number]
+    title: string
+    details: Record<string, unknown>
+  },
+) {
+  const id = randomUUID()
+  await AppDataSource.query(
+    `
+      insert into notifications (
+        id, alert_rule_id, entity_type, entity_id, severity, title, details
+      ) values ($1, $2, $3, $4, $5, $6, $7)
+    `,
+    [id, rule.id, options.alertEntityType, options.alertEntityId, options.severity, options.title, options.details],
+  )
+  publishSseEvent({
+    type: 'alert',
+    alertRuleId: rule.id,
+    entityType: options.alertEntityType,
+    entityId: options.alertEntityId,
+    severity: options.severity,
+    title: options.title,
+    details: options.details,
+  })
+  return { id, inserted: true }
+}
+
+let evaluateAlertsRunning = false
+
+function normalizePositiveInteger(value: unknown, fallback: number): number {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) return Math.floor(value)
+  if (typeof value === 'string') {
+    const parsed = Number.parseInt(value, 10)
+    if (Number.isFinite(parsed) && parsed > 0) return parsed
+  }
+  return fallback
+}
+
+async function searchMessagesWithMeilisearch(
+  q: string,
+  chat: string,
+  limit: number,
+  offset: number,
+): Promise<{ rows: MessageRow[]; total: number; limit: number; offset: number } | null> {
+  if (!MEILISEARCH_URL) return null
+
+  try {
+    const base = MEILISEARCH_URL.replace(/\/$/, '')
+    const payload = {
+      q,
+      limit,
+      offset,
+      attributesToRetrieve: ['id'],
+    }
+    const headers: Record<string, string> = { 'content-type': 'application/json' }
+    if (MEILISEARCH_API_KEY) {
+      headers.Authorization = `Bearer ${MEILISEARCH_API_KEY}`
+    }
+
+    const res = await fetch(`${base}/indexes/${encodeURIComponent(MEILISEARCH_INDEX)}/search`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+    })
+    if (!res.ok) return null
+
+    const payloadJson = (await res.json()) as {
+      hits?: Array<{ id?: string }>
+      estimatedTotalHits?: number
+      totalHits?: number
+    }
+    const ids = (payloadJson.hits ?? []).map((hit) => (typeof hit.id === 'string' ? hit.id : null)).filter(Boolean) as string[]
+    if (!ids.length) {
+      return {
+        rows: [],
+        total: Number(payloadJson.totalHits ?? payloadJson.estimatedTotalHits ?? 0),
+        limit,
+        offset,
+      }
+    }
+
+    const params: Array<unknown> = [ids]
+    const chatClause = chat ? 'where c.wa_jid = $2' : ''
+    if (chat) params.push(chat)
+
+    const rows = (await AppDataSource.query(
+      `
+        with ids as (
+          select * from unnest($1::uuid[]) with ordinality as x(id, ord)
+        )
+        select
+          m.id,
+          m.wa_message_id,
+          m.account_id,
+          m.timestamp,
+          m.type,
+          m.text,
+          m.from_me,
+          m.sender_contact_id,
+          c.wa_jid as chat_wa_jid,
+          c.type as chat_type,
+          c.subject as chat_subject,
+          s.wa_jid as sender_wa_jid,
+          coalesce(s.display_name, s.push_name) as sender_name,
+          count(md.id)::int as media_count,
+          coalesce(
+            json_agg(
+              json_build_object('id', md.id, 'type', md.type, 'storage_status', md.storage_status)
+              order by md.created_at
+            ) filter (where md.id is not null),
+            '[]'
+          ) as media
+        from ids
+        join messages m on m.id = ids.id
+        join chats c on c.id = m.chat_id
+        left join contacts s on s.id = m.sender_contact_id
+        left join media md on md.message_id = m.id
+        ${chatClause}
+        group by ids.ord, m.id, c.id, s.id
+        order by ids.ord
+      `,
+      params,
+    )) as MessageRow[]
+
+    return {
+      rows,
+      total: Number(payloadJson.totalHits ?? payloadJson.estimatedTotalHits ?? 0),
+      limit,
+      offset,
+    }
+  } catch (error) {
+    console.error('meilisearch search fallback to postgres:', error)
+    return null
+  }
 }
 
 async function handleMedia(id: string, res: ServerResponse): Promise<void> {

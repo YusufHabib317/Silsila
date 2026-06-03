@@ -89,7 +89,7 @@ h2 {
 
 .metrics {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
   gap: 10px;
   margin-bottom: 14px;
 }
@@ -240,7 +240,8 @@ td {
   min-width: 0;
 }
 
-.transactionForm {
+.transactionForm,
+.alertRuleForm {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
@@ -248,7 +249,8 @@ td {
   border-bottom: 1px solid var(--line);
 }
 
-.transactionForm label {
+.transactionForm label,
+.alertRuleForm label {
   display: grid;
   gap: 4px;
   font-size: 12px;
@@ -257,6 +259,8 @@ td {
 
 .transactionForm input,
 .transactionForm select,
+.alertRuleForm input,
+.alertRuleForm select,
 .searchbar input,
 .searchbar select,
 .searchbar button {
@@ -329,6 +333,45 @@ td {
 .tableWrap {
   height: calc(100vh - 280px);
   overflow: auto;
+}
+
+.alertRuleForm .primaryAction {
+  align-self: end;
+}
+
+h3 {
+  margin: 10px 12px 8px;
+  font-size: 13px;
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.severityPill {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  background: #eef5ec;
+  color: var(--accent-dark);
+}
+
+.severityPill.warning {
+  background: #fff4e2;
+  color: var(--warn);
+}
+
+.severityPill.critical {
+  background: #fde7e7;
+  color: #9f2e2e;
+}
+
+.alertsRowDetails {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
 }
 
 table {

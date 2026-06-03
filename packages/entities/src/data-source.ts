@@ -12,6 +12,8 @@ import { AccountChat } from './entities/account-chat.entity'
 import { ChatParticipant } from './entities/chat-participant.entity'
 import { ArchivedMessage } from './entities/archived-message.entity'
 import { Media } from './entities/media.entity'
+import { AlertRule } from './entities/alert-rule.entity'
+import { Notification } from './entities/notification.entity'
 import { Tag } from './entities/tag.entity'
 import { ContactTag } from './entities/contact-tag.entity'
 import { Transaction } from './entities/transaction.entity'
@@ -22,6 +24,7 @@ import { InitWaAuth1700000000000 } from './migrations/1700000000000-InitWaAuth'
 import { CreateRawArchive1700000001000 } from './migrations/1700000001000-CreateRawArchive'
 import { Phase2MediaPipeline1700000002000 } from './migrations/1700000002000-Phase2MediaPipeline'
 import { Phase3Tracking1700000003000 } from './migrations/1700000003000-Phase3Tracking'
+import { Phase4SearchAlerts1700000004000 } from './migrations/1700000004000-Phase4SearchAlerts'
 
 // Load the monorepo-root .env explicitly. dotenv's default looks in process.cwd(),
 // but `pnpm --filter` runs these scripts with cwd set to this package dir, so the
@@ -51,6 +54,8 @@ export const AppDataSource = new DataSource({
     ChatParticipant,
     ArchivedMessage,
     Media,
+    AlertRule,
+    Notification,
     Tag,
     ContactTag,
     Transaction,
@@ -63,6 +68,7 @@ export const AppDataSource = new DataSource({
     CreateRawArchive1700000001000,
     Phase2MediaPipeline1700000002000,
     Phase3Tracking1700000003000,
+    Phase4SearchAlerts1700000004000,
   ],
   // NEVER turn this on in production — it silently alters your tables.
   // We use explicit migrations instead.

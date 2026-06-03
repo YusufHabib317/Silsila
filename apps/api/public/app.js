@@ -13,6 +13,13 @@ const state = {
     offset: 0,
     total: 0,
   },
+  alerts: {
+    unreadOnly: true,
+    ruleKind: '',
+    limit: 25,
+    offset: 0,
+    total: 0,
+  },
   view: 'messages',
 }
 
@@ -56,6 +63,23 @@ const els = {
   transactionStatus: document.getElementById('transactionStatus'),
   transactionNotes: document.getElementById('transactionNotes'),
   transactionCreateForm: document.getElementById('createTransactionForm'),
+  alertsTab: document.getElementById('alertsTab'),
+  alertsPane: document.getElementById('alertsPane'),
+  alertFilterForm: document.getElementById('alertFilterForm'),
+  alertsUnreadOnly: document.getElementById('alertsUnreadOnly'),
+  alertsRuleKindFilter: document.getElementById('alertsRuleKindFilter'),
+  alertsClearButton: document.getElementById('alertsClearButton'),
+  alertRulesRows: document.getElementById('alertRulesRows'),
+  alertsRows: document.getElementById('alertsRows'),
+  alertsPrevButton: document.getElementById('alertsPrevButton'),
+  alertsNextButton: document.getElementById('alertsNextButton'),
+  alertsPageInfo: document.getElementById('alertsPageInfo'),
+  createAlertRuleForm: document.getElementById('createAlertRuleForm'),
+  alertRuleName: document.getElementById('alertRuleName'),
+  alertRuleKind: document.getElementById('alertRuleKind'),
+  alertRuleThreshold: document.getElementById('alertRuleThreshold'),
+  alertRuleCooldown: document.getElementById('alertRuleCooldown'),
+  alertRuleKeyword: document.getElementById('alertRuleKeyword'),
 }
 
 async function api(path, options = {}) {
@@ -81,7 +105,15 @@ async function api(path, options = {}) {
 }
 
 async function loadAll() {
-  await Promise.all([loadHealth(), loadStats(), loadChats(), loadMessages(), loadTransactions()])
+  await Promise.all([
+    loadHealth(),
+    loadStats(),
+    loadChats(),
+    loadMessages(),
+    loadTransactions(),
+    loadAlertRules(),
+    loadAlerts(),
+  ])
 }
 
 async function loadHealth() {
@@ -103,6 +135,15 @@ async function loadStats() {
   els.mediaCount.textContent = formatNumber(counts.media)
   if (els.transactionsCount) {
     els.transactionsCount.textContent = formatNumber(counts.transactions)
+  }
+  if (els.pendingTransactionsCount) {
+    els.pendingTransactionsCount.textContent = formatNumber(counts.pending_transactions)
+  }
+  if (els.unreadAlertsCount) {
+    els.unreadAlertsCount.textContent = formatNumber(counts.unread_alerts)
+  }
+  if (els.criticalAlertsCount) {
+    els.criticalAlertsCount.textContent = formatNumber(counts.critical_alerts)
   }
 }
 
@@ -292,6 +333,110 @@ async function loadTransactions() {
   els.txNextButton.disabled = state.transactions.offset + state.transactions.limit >= state.transactions.total
 }
 
+async function loadAlertRules() {
+  const { rows } = await api('/api/alert-rules')
+  if (!els.alertRulesRows) return
+  els.alertRulesRows.innerHTML = ''
+
+  if (!rows.length) {
+    els.alertRulesRows.innerHTML = `<tr><td colspan="7" class="empty">No alert rules configured.</td></tr>`
+    return
+  }
+
+  for (const rule of rows) {
+    const row = document.createElement('tr')
+    const enabledText = rule.enabled ? 'Enabled' : 'Disabled'
+    const paramsText = typeof rule.params === 'object' && rule.params ? safeStringify(rule.params) : ''
+    row.innerHTML = `
+      <td>${escapeHtml(rule.name || 'Unnamed rule')}</td>
+      <td>${escapeHtml(rule.kind || '')}</td>
+      <td>${formatNumber(rule.thresholdMinutes || 0)}</td>
+      <td>${formatNumber(rule.cooldownMinutes || 0)}</td>
+      <td>${escapeHtml(paramsText)}</td>
+      <td>${escapeHtml(enabledText)}</td>
+      <td>${formatDate(rule.created_at || rule.createdAt)}</td>
+    `
+    els.alertRulesRows.appendChild(row)
+  }
+}
+
+async function loadAlerts() {
+  const params = new URLSearchParams({
+    limit: String(state.alerts.limit),
+    offset: String(state.alerts.offset),
+    unread: state.alerts.unreadOnly ? 'true' : 'false',
+  })
+  if (state.alerts.ruleKind) params.set('kind', state.alerts.ruleKind)
+
+  const data = await api(`/api/alerts?${params}`)
+  state.alerts.total = data.total
+  els.alertsRows.innerHTML = ''
+
+  if (!data.rows.length) {
+    els.alertsRows.innerHTML = `<tr><td colspan="8" class="empty">No alerts found.</td></tr>`
+    els.alertsPageInfo.textContent = '0 alerts'
+    els.alertsPrevButton.disabled = true
+    els.alertsNextButton.disabled = true
+    return
+  }
+
+  for (const alert of data.rows) {
+    const row = document.createElement('tr')
+    const entity = `${escapeHtml(alert.entityType || '')}: ${escapeHtml(alert.entityId || '')}`
+    const createdAt = formatDate(alert.createdAt || alert.created_at)
+    const severity = String(alert.severity || 'info')
+    row.innerHTML = `
+      <td>${createdAt}</td>
+      <td><span class="severityPill ${escapeHtml(severity)}">${escapeHtml(severity)}</span></td>
+      <td>${escapeHtml(alert.alertRuleName || '')}</td>
+      <td>${escapeHtml(entity)}</td>
+      <td><span class="snippet">${escapeHtml(alert.entityId || '')}</span></td>
+      <td>${escapeHtml(alert.title || '')}</td>
+      <td class="alertsRowDetails">${escapeHtml(formatAlertDetails(alert.details))}</td>
+      <td>
+        ${alert.isRead ? '<span class="muted">Read</span>' : `<button class="smallButton" type="button" data-action="ackAlert" data-id="${escapeHtml(alert.id)}">Acknowledge</button>`}
+      </td>
+    `
+    const ackButton = row.querySelector('[data-action="ackAlert"]')
+    if (ackButton instanceof HTMLButtonElement) {
+      ackButton.addEventListener('click', async () => {
+        const alertId = ackButton.dataset.id
+        if (!alertId) return
+        try {
+          await api(`/api/alerts/${encodeURIComponent(alertId)}/ack`, { method: 'POST' })
+          await Promise.all([loadAlerts(), loadAlertRules(), loadStats()])
+        } catch (error) {
+          console.error(error)
+          alert(`Failed to acknowledge alert: ${error.message}`)
+        }
+      })
+    }
+
+    els.alertsRows.appendChild(row)
+  }
+
+  const start = state.alerts.total === 0 ? 0 : state.alerts.offset + 1
+  const end = Math.min(state.alerts.offset + state.alerts.limit, state.alerts.total)
+  els.alertsPageInfo.textContent = `${formatNumber(start)}-${formatNumber(end)} of ${formatNumber(state.alerts.total)}`
+  els.alertsPrevButton.disabled = state.alerts.offset === 0
+  els.alertsNextButton.disabled = state.alerts.offset + state.alerts.limit >= state.alerts.total
+}
+
+function formatAlertDetails(details) {
+  if (details == null) return ''
+  if (typeof details === 'string') return details
+  if (typeof details === 'object') return safeStringify(details)
+  return String(details)
+}
+
+function safeStringify(value) {
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value)
+  }
+}
+
 els.searchForm.addEventListener('submit', (event) => {
   event.preventDefault()
   state.messages.q = els.searchInput.value.trim()
@@ -363,6 +508,62 @@ els.transactionCreateForm.addEventListener('submit', async (event) => {
   }
 })
 
+els.alertFilterForm?.addEventListener('submit', (event) => {
+  event.preventDefault()
+  state.alerts.unreadOnly = !!els.alertsUnreadOnly?.checked
+  state.alerts.ruleKind = (els.alertsRuleKindFilter?.value ?? '').trim()
+  state.alerts.offset = 0
+  loadAlerts().catch((error) => {
+    console.error(error)
+    alert(`Failed to load alerts: ${error.message}`)
+  })
+})
+
+els.alertsClearButton?.addEventListener('click', () => {
+  state.alerts.unreadOnly = true
+  state.alerts.ruleKind = ''
+  state.alerts.offset = 0
+  if (els.alertsUnreadOnly) els.alertsUnreadOnly.checked = true
+  if (els.alertsRuleKindFilter) els.alertsRuleKindFilter.value = ''
+  loadAlerts().catch((error) => {
+    console.error(error)
+    alert(`Failed to load alerts: ${error.message}`)
+  })
+})
+
+els.createAlertRuleForm?.addEventListener('submit', async (event) => {
+  event.preventDefault()
+  const kind = (els.alertRuleKind?.value ?? '').trim()
+  const thresholdMinutes = Number.parseInt((els.alertRuleThreshold?.value ?? '').trim(), 10)
+  const cooldownMinutes = Number.parseInt((els.alertRuleCooldown?.value ?? '').trim(), 10)
+  const keyword = (els.alertRuleKeyword?.value ?? '').trim()
+
+  if (kind === 'keyword' && !keyword) {
+    alert('Keyword is required for keyword rules.')
+    return
+  }
+
+  try {
+    await api('/api/alert-rules', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: (els.alertRuleName?.value ?? '').trim() || 'Untitled rule',
+        kind,
+        thresholdMinutes: Number.isFinite(thresholdMinutes) ? thresholdMinutes : null,
+        cooldownMinutes: Number.isFinite(cooldownMinutes) ? cooldownMinutes : null,
+        params: kind === 'keyword' ? { keyword } : {},
+      }),
+    })
+    els.createAlertRuleForm.reset()
+    state.alerts.offset = 0
+    state.alerts.ruleKind = kind
+    await Promise.all([loadAlertRules(), loadAlerts(), loadStats()])
+  } catch (error) {
+    console.error(error)
+    alert(`Failed to create alert rule: ${error.message}`)
+  }
+})
+
 els.refreshButton.addEventListener('click', loadAll)
 
 els.prevButton.addEventListener('click', () => {
@@ -383,29 +584,60 @@ els.txNextButton.addEventListener('click', () => {
   loadTransactions()
 })
 
+els.alertsPrevButton?.addEventListener('click', () => {
+  state.alerts.offset = Math.max(0, state.alerts.offset - state.alerts.limit)
+  loadAlerts()
+})
+els.alertsNextButton?.addEventListener('click', () => {
+  state.alerts.offset += state.alerts.limit
+  loadAlerts()
+})
+
 els.messagesTab.addEventListener('click', () => {
   setActiveView('messages')
 })
 els.transactionsTab.addEventListener('click', () => {
   setActiveView('transactions')
 })
+els.alertsTab?.addEventListener('click', () => {
+  setActiveView('alerts')
+})
 
 function setActiveView(view) {
   state.view = view
   const isMessages = view === 'messages'
-  els.messagesTab.classList.toggle('active', isMessages)
-  els.transactionsTab.classList.toggle('active', !isMessages)
-  els.messagesTab.setAttribute('aria-selected', isMessages ? 'true' : 'false')
-  els.transactionsTab.setAttribute('aria-selected', isMessages ? 'false' : 'true')
-  els.messagesPane.classList.toggle('hidden', !isMessages)
-  els.transactionsPane.classList.toggle('hidden', isMessages)
-  els.messagesPane.setAttribute('aria-hidden', String(!isMessages))
-  els.transactionsPane.setAttribute('aria-hidden', String(isMessages))
+  const isTransactions = view === 'transactions'
+  const isAlerts = view === 'alerts'
 
-  if (!isMessages) {
+  els.messagesTab.classList.toggle('active', isMessages)
+  els.transactionsTab.classList.toggle('active', isTransactions)
+  if (els.alertsTab) {
+    els.alertsTab.classList.toggle('active', isAlerts)
+  }
+  els.messagesTab.setAttribute('aria-selected', isMessages ? 'true' : 'false')
+  els.transactionsTab.setAttribute('aria-selected', isTransactions ? 'true' : 'false')
+  if (els.alertsTab) {
+    els.alertsTab.setAttribute('aria-selected', isAlerts ? 'true' : 'false')
+  }
+
+  els.messagesPane.classList.toggle('hidden', !isMessages)
+  els.transactionsPane.classList.toggle('hidden', !isTransactions)
+  if (els.alertsPane) {
+    els.alertsPane.classList.toggle('hidden', !isAlerts)
+  }
+  els.messagesPane.setAttribute('aria-hidden', String(!isMessages))
+  els.transactionsPane.setAttribute('aria-hidden', String(!isTransactions))
+  if (els.alertsPane) {
+    els.alertsPane.setAttribute('aria-hidden', String(!isAlerts))
+  }
+
+  if (isTransactions) {
     loadTransactions()
-  } else {
+  } else if (isMessages) {
     loadMessages()
+  } else {
+    loadAlertRules().catch(() => {})
+    loadAlerts()
   }
 }
 
@@ -441,6 +673,9 @@ function scheduleRefresh() {
     if (state.view === 'transactions') {
       loadTransactions().catch(() => {})
     }
+    if (state.view === 'alerts') {
+      loadAlerts().catch(() => {})
+    }
   }, 500)
 }
 
@@ -453,7 +688,7 @@ function startLiveUpdates() {
     } catch {
       return
     }
-    if (parsed.type === 'message' || parsed.type === 'media') scheduleRefresh()
+    if (parsed.type === 'message' || parsed.type === 'media' || parsed.type === 'alert') scheduleRefresh()
   }
   // EventSource auto-reconnects on error; nothing to do here.
 }

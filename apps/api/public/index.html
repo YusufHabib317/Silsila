@@ -22,6 +22,9 @@
         <div><span id="contactsCount">0</span><small>Contacts</small></div>
         <div><span id="mediaCount">0</span><small>Media rows</small></div>
         <div><span id="transactionsCount">0</span><small>Transactions</small></div>
+        <div><span id="pendingTransactionsCount">0</span><small>Pending transactions</small></div>
+        <div><span id="unreadAlertsCount">0</span><small>Unread alerts</small></div>
+        <div><span id="criticalAlertsCount">0</span><small>Critical alerts</small></div>
       </section>
 
       <section class="workspace">
@@ -37,6 +40,7 @@
           <div class="panelTabs" role="tablist">
             <button type="button" class="panelTab active" id="messagesTab" role="tab" aria-selected="true" aria-controls="messagesPane">Messages</button>
             <button type="button" class="panelTab" id="transactionsTab" role="tab" aria-selected="false" aria-controls="transactionsPane">Transactions</button>
+            <button type="button" class="panelTab" id="alertsTab" role="tab" aria-selected="false" aria-controls="alertsPane">Alerts</button>
           </div>
 
           <section class="panel" id="messagesPane">
@@ -156,6 +160,94 @@
               <button id="txPrevButton" type="button">Previous</button>
               <span id="txPageInfo">0 transactions</span>
               <button id="txNextButton" type="button">Next</button>
+            </footer>
+          </section>
+
+          <section class="panel hidden" id="alertsPane" aria-hidden="true">
+            <form class="searchbar" id="alertFilterForm">
+              <label for="alertsUnreadOnly">
+                <input id="alertsUnreadOnly" type="checkbox" checked />
+                Unread only
+              </label>
+              <select id="alertsRuleKindFilter" name="kind">
+                <option value="">All rule kinds</option>
+                <option value="keyword">keyword</option>
+                <option value="stale_pending">stale_pending</option>
+                <option value="no_movement">no_movement</option>
+              </select>
+              <button type="submit">Filter</button>
+              <button type="button" id="alertsClearButton">Clear</button>
+            </form>
+
+            <form class="alertRuleForm" id="createAlertRuleForm">
+              <label>
+                Rule name
+                <input id="alertRuleName" required placeholder="e.g. High-value keyword" />
+              </label>
+              <label>
+                Kind
+                <select id="alertRuleKind" required>
+                  <option value="keyword">keyword</option>
+                  <option value="stale_pending">stale_pending</option>
+                  <option value="no_movement">no_movement</option>
+                </select>
+              </label>
+              <label>
+                Threshold minutes
+                <input id="alertRuleThreshold" type="number" min="1" placeholder="60" />
+              </label>
+              <label>
+                Cooldown minutes
+                <input id="alertRuleCooldown" type="number" min="1" placeholder="30" />
+              </label>
+              <label>
+                Keyword
+                <input id="alertRuleKeyword" placeholder="Required for keyword rules" />
+              </label>
+              <button type="submit" class="primaryAction">Save rule</button>
+            </form>
+
+            <div class="tableWrap">
+              <h3>Alert rules</h3>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Kind</th>
+                    <th>Threshold</th>
+                    <th>Cooldown</th>
+                    <th>Params</th>
+                    <th>Enabled</th>
+                    <th>Created</th>
+                  </tr>
+                </thead>
+                <tbody id="alertRulesRows"></tbody>
+              </table>
+            </div>
+
+            <div class="tableWrap">
+              <h3>Active alerts</h3>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Severity</th>
+                    <th>Rule</th>
+                    <th>Entity</th>
+                    <th>Entity ID</th>
+                    <th>Title</th>
+                    <th>Details</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody id="alertsRows"></tbody>
+              </table>
+            </div>
+
+            <footer class="pager">
+              <button id="alertsPrevButton" type="button">Previous</button>
+              <span id="alertsPageInfo">0 alerts</span>
+              <button id="alertsNextButton" type="button">Next</button>
             </footer>
           </section>
         </section>

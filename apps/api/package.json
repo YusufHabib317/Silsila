@@ -9,6 +9,8 @@
   },
   "dependencies": {
     "@wa/entities": "workspace:*",
+    "@wa/storage": "workspace:*",
+    "ioredis": "^5.4.1",
     "dotenv": "^16.4.5",
     "reflect-metadata": "^0.2.2"
   },

@@ -3,10 +3,18 @@ import { createReadStream, existsSync } from 'node:fs'
 import { extname, join, normalize } from 'node:path'
 import { createServer, IncomingMessage, ServerResponse } from 'node:http'
 import { URL } from 'node:url'
+import IORedis from 'ioredis'
 import { AppDataSource } from '@wa/entities'
+import { storage } from '@wa/storage'
 
 const port = Number(process.env.API_PORT ?? 3000)
 const publicDir = join(__dirname, '../public')
+
+// Must match the worker's WA_EVENTS_CHANNEL.
+const WA_EVENTS_CHANNEL = 'wa:events'
+
+// Connected dashboard SSE clients; the Redis subscriber fans events out to them.
+const sseClients = new Set<ServerResponse>()
 
 type MessageRow = {
   id: string
@@ -22,11 +30,24 @@ type MessageRow = {
   sender_wa_jid: string | null
   sender_name: string | null
   media_count: string
+  media: { id: string; type: string; storage_status: string }[]
+}
+
+// Subscribe to worker-published live events and push them to all SSE clients.
+function startEventSubscriber() {
+  const url = process.env.REDIS_URL || 'redis://localhost:6379'
+  const sub = new IORedis(url, { maxRetriesPerRequest: null })
+  sub.on('message', (_channel: string, payload: string) => {
+    for (const res of sseClients) res.write(`data: ${payload}\n\n`)
+  })
+  sub.on('error', (e: Error) => console.error('redis subscriber error:', e.message))
+  sub.subscribe(WA_EVENTS_CHANNEL).catch((e: unknown) => console.error('redis subscribe failed:', e))
 }
 
 async function main() {
   await AppDataSource.initialize()
   console.log('database connected')
+  startEventSubscriber()
 
   const server = createServer((req, res) => {
     void route(req, res).catch((e) => {
@@ -73,6 +94,16 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     return
   }
 
+  if (url.pathname === '/api/stream') {
+    handleStream(req, res)
+    return
+  }
+
+  if (url.pathname.startsWith('/api/media/')) {
+    await handleMedia(decodeURIComponent(url.pathname.slice('/api/media/'.length)), res)
+    return
+  }
+
   if (url.pathname === '/favicon.ico') {
     res.statusCode = 204
     res.end()
@@ -80,6 +111,49 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   }
 
   await serveStatic(url.pathname, res)
+}
+
+// SSE: hold the connection open, register it, and let the Redis subscriber push
+// `message`/`media` events. A periodic comment keeps proxies from timing out.
+function handleStream(req: IncomingMessage, res: ServerResponse): void {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  })
+  res.write('retry: 3000\n\n')
+  sseClients.add(res)
+
+  const heartbeat = setInterval(() => res.write(': ping\n\n'), 25_000)
+  req.on('close', () => {
+    clearInterval(heartbeat)
+    sseClients.delete(res)
+  })
+}
+
+// Redirect to a short-lived presigned R2 URL so the browser fetches media directly
+// from R2 (zero egress). Only `stored` media has an object to serve.
+async function handleMedia(id: string, res: ServerResponse): Promise<void> {
+  const [row] = await AppDataSource.query(
+    `select storage_status, r2_key from media where id = $1`,
+    [id],
+  )
+  if (!row) {
+    sendJson(res, 404, { error: 'not_found' })
+    return
+  }
+  if (row.storage_status !== 'stored' || !row.r2_key) {
+    sendJson(res, 409, { status: row.storage_status })
+    return
+  }
+  if (!storage.isEnabled) {
+    sendJson(res, 503, { error: 'storage_disabled' })
+    return
+  }
+  const signed = await storage.getSignedUrl(row.r2_key, 300)
+  res.statusCode = 302
+  res.setHeader('location', signed)
+  res.end()
 }
 
 async function getStats() {
@@ -157,7 +231,14 @@ async function getMessages(url: URL) {
         c.subject as chat_subject,
         s.wa_jid as sender_wa_jid,
         coalesce(s.display_name, s.push_name) as sender_name,
-        count(md.id)::int as media_count
+        count(md.id)::int as media_count,
+        coalesce(
+          json_agg(
+            json_build_object('id', md.id, 'type', md.type, 'storage_status', md.storage_status)
+            order by md.created_at
+          ) filter (where md.id is not null),
+          '[]'
+        ) as media
       from messages m
       join chats c on c.id = m.chat_id
       left join contacts s on s.id = m.sender_contact_id

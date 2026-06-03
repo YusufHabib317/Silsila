@@ -11,6 +11,7 @@ export class Media {
   @Column({ type: 'varchar', length: 32 })
   type!: string
 
+  // pending | stored | skipped | failed
   @Column({ type: 'varchar', length: 32, name: 'storage_status' })
   storageStatus!: string
 
@@ -22,6 +23,20 @@ export class Media {
 
   @Column({ type: 'bigint', name: 'size_bytes', nullable: true })
   sizeBytes!: string | null
+
+  // Size of the object actually written to storage (after compression).
+  @Column({ type: 'bigint', name: 'stored_bytes', nullable: true })
+  storedBytes!: string | null
+
+  // MIME of the stored object (e.g. image/webp after compression).
+  @Column({ type: 'varchar', length: 255, name: 'stored_mime', nullable: true })
+  storedMime!: string | null
+
+  @Column({ type: 'text', name: 'storage_error', nullable: true })
+  storageError!: string | null
+
+  @Column({ type: 'timestamptz', name: 'processed_at', nullable: true })
+  processedAt!: Date | null
 
   @Column({ type: 'numeric', name: 'duration_seconds', nullable: true })
   durationSeconds!: string | null

@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { DataSource } from 'typeorm'
 import * as neon from '@neondatabase/serverless'
 import ws from 'ws'
-import { WaSession } from './entities/wa-session.entity'
+import { Account } from './entities/account.entity'
 import { WaAuthKey } from './entities/wa-auth-key.entity'
 import { Contact } from './entities/contact.entity'
 import { Chat } from './entities/chat.entity'
@@ -14,6 +14,7 @@ import { ArchivedMessage } from './entities/archived-message.entity'
 import { Media } from './entities/media.entity'
 import { InitWaAuth1700000000000 } from './migrations/1700000000000-InitWaAuth'
 import { CreateRawArchive1700000001000 } from './migrations/1700000001000-CreateRawArchive'
+import { Phase2MediaPipeline1700000002000 } from './migrations/1700000002000-Phase2MediaPipeline'
 
 // Load the monorepo-root .env explicitly. dotenv's default looks in process.cwd(),
 // but `pnpm --filter` runs these scripts with cwd set to this package dir, so the
@@ -34,8 +35,12 @@ export const AppDataSource = new DataSource({
   driver: neon,
   url: process.env.DATABASE_URL,
   ssl: useSsl ? { rejectUnauthorized: false } : false,
-  entities: [WaSession, WaAuthKey, Contact, Chat, AccountChat, ChatParticipant, ArchivedMessage, Media],
-  migrations: [InitWaAuth1700000000000, CreateRawArchive1700000001000],
+  entities: [Account, WaAuthKey, Contact, Chat, AccountChat, ChatParticipant, ArchivedMessage, Media],
+  migrations: [
+    InitWaAuth1700000000000,
+    CreateRawArchive1700000001000,
+    Phase2MediaPipeline1700000002000,
+  ],
   // NEVER turn this on in production — it silently alters your tables.
   // We use explicit migrations instead.
   synchronize: false,

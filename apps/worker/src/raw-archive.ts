@@ -2,14 +2,17 @@ import { createHash } from 'node:crypto'
 import { BufferJSON, proto } from 'baileys'
 import { DataSource, EntityManager } from 'typeorm'
 import {
+  Account,
   AccountChat,
   ArchivedMessage,
   Chat,
   ChatParticipant,
   Contact,
+  DEFAULT_MEDIA_POLICY,
   Media,
-  WaSession,
+  MediaPolicy,
 } from '@wa/entities'
+import type { MediaJobData } from './queue/media-queue'
 
 const CONTACT_NS = 'contact'
 const CHAT_NS = 'chat'
@@ -18,36 +21,71 @@ const MEDIA_NS = 'media'
 
 type MessageContent = Record<string, any>
 
+// A newly-stored message + any media that needs downloading. wa-connection turns
+// these into queue jobs and SSE events.
+export interface PersistedMessage {
+  messageId: string
+  chatJid: string
+  type: string
+  timestamp: string | null
+  mediaJobs: MediaJobData[]
+}
+
+export interface PersistResult {
+  stored: number
+  messages: PersistedMessage[]
+  mediaJobs: MediaJobData[]
+}
+
 export async function persistRawMessages(
   dataSource: DataSource,
   accountId: string,
   messages: proto.IWebMessageInfo[],
-): Promise<number> {
-  let stored = 0
+): Promise<PersistResult> {
+  const result: PersistResult = { stored: 0, messages: [], mediaJobs: [] }
 
   await dataSource.transaction(async (manager) => {
-    await manager.getRepository(WaSession).upsert(
+    await manager.getRepository(Account).upsert(
       { id: accountId, status: 'connected', lastSeenAt: new Date() },
       ['id'],
     )
 
+    // Resolve the account's capture policy once per batch (fresh each upsert event).
+    const policy = await loadMediaPolicy(manager, accountId)
+
     for (const msg of messages) {
-      const didStore = await persistOneMessage(manager, accountId, msg)
-      if (didStore) stored++
+      const persisted = await persistOneMessage(manager, accountId, msg, policy)
+      if (persisted) {
+        result.stored++
+        result.messages.push(persisted)
+        result.mediaJobs.push(...persisted.mediaJobs)
+      }
     }
   })
 
-  return stored
+  return result
+}
+
+async function loadMediaPolicy(
+  manager: EntityManager,
+  accountId: string,
+): Promise<MediaPolicy> {
+  const account = await manager.getRepository(Account).findOne({
+    where: { id: accountId },
+    select: { mediaPolicy: true },
+  })
+  return account?.mediaPolicy ?? DEFAULT_MEDIA_POLICY
 }
 
 async function persistOneMessage(
   manager: EntityManager,
   accountId: string,
   msg: proto.IWebMessageInfo,
-): Promise<boolean> {
+  policy: MediaPolicy,
+): Promise<PersistedMessage | null> {
   const remoteJid = msg.key?.remoteJid
   const waMessageId = msg.key?.id
-  if (!remoteJid || !waMessageId || remoteJid === 'status@broadcast') return false
+  if (!remoteJid || !waMessageId || remoteJid === 'status@broadcast') return null
 
   const chatId = stableUuid(CHAT_NS, remoteJid)
   const chatType = remoteJid.endsWith('@g.us') ? 'group' : 'dm'
@@ -83,7 +121,9 @@ async function persistOneMessage(
     where: { accountId, waMessageId },
     select: { id: true },
   })
-  if (existing) return false
+  if (existing) return null
+
+  const timestamp = toMessageDate(msg.messageTimestamp)
 
   await manager.getRepository(ArchivedMessage).insert({
     id: messageId,
@@ -92,32 +132,49 @@ async function persistOneMessage(
     chatId,
     senderContactId,
     fromMe: Boolean(msg.key?.fromMe),
-    timestamp: toMessageDate(msg.messageTimestamp),
+    timestamp,
     type: messageType,
     text: extractText(content),
     raw: JSON.parse(JSON.stringify(msg, BufferJSON.replacer)),
   })
 
-  const mediaRows = extractMedia(content).map((media, index) => ({
-    id: stableUuid(MEDIA_NS, `${messageId}:${index}:${media.type}`),
-    messageId,
-    type: media.type,
-    storageStatus: 'skipped',
-    r2Key: null,
-    mime: media.mime,
-    sizeBytes: media.sizeBytes,
-    durationSeconds: media.durationSeconds,
-    width: media.width,
-    height: media.height,
-    originalFilename: media.originalFilename,
-    sha256: media.sha256,
-  }))
+  // Apply the per-type media policy: 'skip' → metadata-only row; otherwise write a
+  // 'pending' row and queue a download/compress/upload job.
+  const mediaJobs: MediaJobData[] = []
+  const mediaRows = extractMedia(content).map((media, index) => {
+    const id = stableUuid(MEDIA_NS, `${messageId}:${index}:${media.type}`)
+    const action = policy[media.type] ?? 'skip'
+    const capture = action !== 'skip'
+    if (capture) {
+      mediaJobs.push({ accountId, mediaId: id, messageId, mediaType: media.type })
+    }
+    return {
+      id,
+      messageId,
+      type: media.type,
+      storageStatus: capture ? 'pending' : 'skipped',
+      r2Key: null,
+      mime: media.mime,
+      sizeBytes: media.sizeBytes,
+      durationSeconds: media.durationSeconds,
+      width: media.width,
+      height: media.height,
+      originalFilename: media.originalFilename,
+      sha256: media.sha256,
+    }
+  })
 
   if (mediaRows.length > 0) {
     await manager.getRepository(Media).insert(mediaRows)
   }
 
-  return true
+  return {
+    messageId,
+    chatJid: remoteJid,
+    type: messageType,
+    timestamp: timestamp ? timestamp.toISOString() : null,
+    mediaJobs,
+  }
 }
 
 async function upsertChat(

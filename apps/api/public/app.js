@@ -108,7 +108,7 @@ async function loadMessages() {
         <td>${escapeHtml(msg.sender_name || msg.sender_wa_jid || (msg.from_me ? 'Me' : 'Unknown'))}</td>
         <td>${escapeHtml(msg.type)}</td>
         <td class="messageText">${escapeHtml(msg.text || `[${msg.type}]`)}</td>
-        <td>${formatNumber(msg.media_count)}</td>
+        <td class="mediaCol">${renderMedia(msg)}</td>
       `
       els.rows.appendChild(row)
     }
@@ -147,6 +147,52 @@ els.nextButton.addEventListener('click', () => {
   loadMessages()
 })
 
+function renderMedia(msg) {
+  const media = Array.isArray(msg.media) ? msg.media : []
+  if (media.length === 0) return '<span class="muted">—</span>'
+
+  return media
+    .map((m) => {
+      const isImage = m.type === 'image' || m.type === 'sticker'
+      if (m.storage_status === 'stored' && isImage) {
+        const src = `/api/media/${encodeURIComponent(m.id)}`
+        return `<a href="${src}" target="_blank" rel="noopener"><img class="thumb" src="${src}" alt="${escapeHtml(m.type)}" loading="lazy" /></a>`
+      }
+      const suffix = m.storage_status === 'pending' ? '…' : m.storage_status === 'failed' ? ' ✗' : ''
+      return `<span class="mediaBadge ${escapeHtml(m.storage_status)}">${escapeHtml(m.type)}${suffix}</span>`
+    })
+    .join('')
+}
+
+// Live updates: the API streams worker events over SSE. Coalesce bursts (a group
+// dumping 40 photos) into one refresh so we don't thrash the table.
+let refreshTimer = null
+function scheduleRefresh() {
+  if (refreshTimer) return
+  refreshTimer = setTimeout(() => {
+    refreshTimer = null
+    loadStats().catch(() => {})
+    if (state.offset === 0 && !state.q) {
+      loadChats().catch(() => {})
+      loadMessages().catch(() => {})
+    }
+  }, 500)
+}
+
+function startLiveUpdates() {
+  const es = new EventSource('/api/stream')
+  es.onmessage = (event) => {
+    let parsed
+    try {
+      parsed = JSON.parse(event.data)
+    } catch {
+      return
+    }
+    if (parsed.type === 'message' || parsed.type === 'media') scheduleRefresh()
+  }
+  // EventSource auto-reconnects on error; nothing to do here.
+}
+
 function formatNumber(value) {
   return new Intl.NumberFormat().format(Number(value || 0))
 }
@@ -173,3 +219,5 @@ loadAll().catch((error) => {
   els.health.textContent = 'Error'
   els.health.className = 'status bad'
 })
+
+startLiveUpdates()

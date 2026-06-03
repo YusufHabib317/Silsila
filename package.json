@@ -2,10 +2,16 @@
   "name": "wa-dashboard",
   "private": true,
   "packageManager": "pnpm@9.0.0",
+  "pnpm": {
+    "overrides": {
+      "ioredis": "5.11.0"
+    }
+  },
   "scripts": {
     "api:dev": "pnpm --filter @wa/api dev",
     "api:start": "pnpm --filter @wa/api start",
     "worker:dev": "pnpm --filter @wa/worker dev",
+    "worker:backfill-media": "pnpm --filter @wa/worker backfill-media",
     "migration:run": "pnpm --filter @wa/entities migration:run",
     "migration:revert": "pnpm --filter @wa/entities migration:revert"
   }

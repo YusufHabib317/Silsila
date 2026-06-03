@@ -269,9 +269,12 @@ th:nth-child(3) {
   width: 190px;
 }
 
-th:nth-child(4),
-th:nth-child(6) {
+th:nth-child(4) {
   width: 86px;
+}
+
+th:nth-child(6) {
+  width: 120px;
 }
 
 .messageText {
@@ -283,6 +286,52 @@ th:nth-child(6) {
 .empty {
   padding: 28px;
   color: var(--muted);
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.mediaCol {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+
+.thumb {
+  width: 48px;
+  height: 48px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--field);
+}
+
+.mediaBadge {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--field);
+  color: var(--muted);
+  text-transform: capitalize;
+}
+
+.mediaBadge.pending {
+  background: #fdf3e2;
+  color: var(--warn);
+}
+
+.mediaBadge.failed {
+  background: #fbe6e6;
+  color: #a11;
+}
+
+.mediaBadge.stored {
+  background: #e3f3ec;
+  color: var(--accent-dark);
 }
 
 .pager {

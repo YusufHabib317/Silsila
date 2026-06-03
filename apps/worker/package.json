@@ -5,13 +5,18 @@
   "main": "src/index.ts",
   "scripts": {
     "dev": "node --watch -r ts-node/register/transpile-only src/index.ts",
-    "start": "node -r ts-node/register/transpile-only src/index.ts"
+    "start": "node -r ts-node/register/transpile-only src/index.ts",
+    "backfill-media": "node -r ts-node/register/transpile-only src/scripts/backfill-media.ts"
   },
   "dependencies": {
     "@wa/entities": "workspace:*",
+    "@wa/storage": "workspace:*",
     "baileys": "^6.7.0",
+    "bullmq": "^5.12.0",
+    "ioredis": "^5.4.1",
     "qrcode-terminal": "^0.12.0",
     "pino": "^9.0.0",
+    "sharp": "^0.33.4",
     "typeorm": "^0.3.20",
     "reflect-metadata": "^0.2.2",
     "dotenv": "^16.4.5"

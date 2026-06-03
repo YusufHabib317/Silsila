@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Silsila Archive</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Silsila</p>
+          <h1>WhatsApp Archive</h1>
+        </div>
+        <div class="status" id="health">Checking</div>
+      </header>
+
+      <section class="metrics" aria-label="Archive totals">
+        <div><span id="messagesCount">0</span><small>Messages</small></div>
+        <div><span id="chatsCount">0</span><small>Chats</small></div>
+        <div><span id="contactsCount">0</span><small>Contacts</small></div>
+        <div><span id="mediaCount">0</span><small>Media rows</small></div>
+      </section>
+
+      <section class="workspace">
+        <aside class="rail">
+          <div class="railHead">
+            <h2>Chats</h2>
+            <button class="iconButton" id="refreshButton" title="Refresh">↻</button>
+          </div>
+          <div id="chatList" class="chatList"></div>
+        </aside>
+
+        <section class="messagesPane">
+          <form class="searchbar" id="searchForm">
+            <input id="searchInput" name="q" placeholder="Search text, sender, or JID" autocomplete="off" />
+            <button type="submit">Search</button>
+            <button type="button" id="clearButton">Clear</button>
+          </form>
+
+          <div class="tableWrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Chat</th>
+                  <th>Sender</th>
+                  <th>Type</th>
+                  <th>Message</th>
+                  <th>Media</th>
+                </tr>
+              </thead>
+              <tbody id="messageRows"></tbody>
+            </table>
+          </div>
+
+          <footer class="pager">
+            <button id="prevButton" type="button">Previous</button>
+            <span id="pageInfo">0 messages</span>
+            <button id="nextButton" type="button">Next</button>
+          </footer>
+        </section>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

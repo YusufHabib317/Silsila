@@ -15,5 +15,6 @@ dedupe. Media files are not downloaded yet; attachment metadata is stored with
 3. `pnpm install`
 4. `pnpm migration:run`             # creates auth + raw archive tables
 5. `pnpm worker:dev`                # scan the QR shown in the terminal
+6. `pnpm api:dev`                   # open the archive dashboard
 
 Link from the phone: WhatsApp > Settings > Linked devices > Link a device.

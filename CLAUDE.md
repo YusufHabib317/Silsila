@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A read-only WhatsApp ingestion system for a clothing supply chain (factory → agent → marketer → customer). It links to the client's WhatsApp number(s) as a companion device via **Baileys** and archives every message into Postgres, with a human-curated tracking layer and dashboard added in later phases.
 
-**This is Phase 1 in progress** — Phase 0 connectivity is done, and live messages now persist into the raw archive layer. Media files are not downloaded yet; attachment metadata is stored as `storage_status = skipped` until the Phase 2 media pipeline. The full multi-phase plan and complete target schema live in `docs/ARCHITECTURE.md`, which is the canonical project reference — read it before building anything beyond the current scaffold.
+**Phase 1 is complete** — Phase 0 connectivity is done, live messages persist into the raw archive layer, and a thin archive API/dashboard can list and search messages. Media files are not downloaded yet; attachment metadata is stored as `storage_status = skipped` until the Phase 2 media pipeline. The full multi-phase plan and complete target schema live in `docs/ARCHITECTURE.md`, which is the canonical project reference — read it before building anything beyond the current scaffold.
 
 ## Commands
 
@@ -18,11 +18,13 @@ cp .env.example .env          # set DATABASE_URL to the Neon direct URL
 pnpm install
 pnpm migration:run            # creates auth + raw archive tables
 pnpm worker:dev               # starts the worker; scan the QR shown in the terminal
+pnpm api:dev                  # starts the archive API/dashboard on API_PORT or 3000
 ```
 
 - `pnpm migration:run` / `pnpm migration:revert` — apply / roll back migrations (delegates to `@wa/entities`).
 - `pnpm --filter @wa/entities migration:generate -d src/data-source.ts <path>` — generate a migration from entity changes.
 - `pnpm worker:dev` — Node watch mode with `ts-node`; `pnpm --filter @wa/worker start` runs once without watch.
+- `pnpm api:dev` — Node watch mode for the archive API/dashboard; `pnpm --filter @wa/api start` runs once without watch.
 - No test or lint setup exists yet. TypeScript runs via `tsx`/`ts-node` directly (no build step in dev).
 
 To re-pair a number: WhatsApp → Settings → Linked devices → Link a device, then scan the terminal QR.
@@ -33,6 +35,7 @@ Monorepo with two workspaces (`apps/*`, `packages/*`):
 
 - **`packages/entities`** (`@wa/entities`) — the single source of truth for the TypeORM `DataSource`, entities, and migrations. Both the worker and (later) the API import from here. `AppDataSource` (`data-source.ts`) reads `DATABASE_URL` / `DATABASE_SSL`; Phase 0 uses a remote Neon direct URL with SSL on.
 - **`apps/worker`** (`@wa/worker`) — the long-running ingestion process. `index.ts` initializes the DataSource and starts one `WaConnection`.
+- **`apps/api`** (`@wa/api`) — the Phase 1 archive API and served dashboard. It exposes `/api/health`, `/api/stats`, `/api/chats`, and `/api/messages` with Postgres full-text search over message text plus JID/name fallback matching.
 
 ### Worker internals
 
@@ -55,6 +58,7 @@ These come from `docs/ARCHITECTURE.md` and the ban-avoidance strategy — preser
 - `DATABASE_URL` — Neon direct Postgres connection URL for the Phase 0 worker.
 - `DATABASE_SSL` — `true` for Neon/managed PG.
 - `ACCOUNT_ID` — a stable human label for the WhatsApp number (e.g. `client-main`). One worker process = one `ACCOUNT_ID`, which becomes the `wa_session.id` / `wa_auth_key.session_id`.
+- `API_PORT` — dashboard/API port; defaults to `3000`.
 
 ### Current schema
 

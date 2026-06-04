@@ -23,7 +23,7 @@ export async function useDbAuthState(
     await repo.upsert({ sessionId, key, value: serialized }, ['sessionId', 'key'])
   }
 
-  const read = async <T = any>(key: string): Promise<T | null> => {
+  const read = async <T>(key: string): Promise<T | null> => {
     const row = await repo.findOne({ where: { sessionId, key } })
     return row ? (JSON.parse(row.value, BufferJSON.reviver) as T) : null
   }
@@ -39,24 +39,37 @@ export async function useDbAuthState(
       creds,
       keys: {
         get: async (type, ids) => {
-          const data: { [id: string]: SignalDataTypeMap[typeof type] } = {}
+          const data = {} as Partial<{
+            [K in keyof SignalDataTypeMap]: { [id: string]: SignalDataTypeMap[K] | null }
+          }>
           await Promise.all(
             ids.map(async (id) => {
-              let value = await read(`${type}-${id}`)
+              const typedType = type as keyof SignalDataTypeMap
+              const existing = await read<SignalDataTypeMap[keyof SignalDataTypeMap]>(`${typedType}-${id}`)
+              let value = existing as SignalDataTypeMap[typeof typedType] | null
               // app-state-sync-key must be rehydrated into its proto type.
-              if (type === 'app-state-sync-key' && value) {
-                value = proto.Message.AppStateSyncKeyData.fromObject(value)
+              if (typedType === 'app-state-sync-key' && value) {
+                value = proto.Message.AppStateSyncKeyData.fromObject(
+                  value as Parameters<typeof proto.Message.AppStateSyncKeyData.fromObject>[0],
+                ) as SignalDataTypeMap[typeof typedType]
               }
-              data[id] = value
+              const bucket = (data[typedType] ??= {}) as { [id: string]: SignalDataTypeMap[typeof typedType] | null }
+              bucket[id] = value
             }),
           )
-          return data
+
+          return data as { [id: string]: SignalDataTypeMap[typeof type] }
         },
         set: async (data) => {
           const tasks: Promise<void>[] = []
           for (const type in data) {
-            for (const id in (data as any)[type]) {
-              const value = (data as any)[type][id]
+            const typedType = type as keyof SignalDataTypeMap
+            const typedData = data[typedType] as
+              | { [id: string]: SignalDataTypeMap[typeof typedType] | null }
+              | undefined
+            if (!typedData) continue
+            for (const id in typedData) {
+              const value = typedData[id]
               const key = `${type}-${id}`
               tasks.push(value ? write(key, value) : remove(key))
             }

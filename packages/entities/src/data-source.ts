@@ -20,11 +20,15 @@ import { Transaction } from './entities/transaction.entity'
 import { TransactionMessage } from './entities/transaction-message.entity'
 import { TransactionStatusHistory } from './entities/transaction-status-history.entity'
 import { Payment } from './entities/payment.entity'
+import { User } from './entities/user.entity'
+import { AuditLog } from './entities/audit-log.entity'
 import { InitWaAuth1700000000000 } from './migrations/1700000000000-InitWaAuth'
 import { CreateRawArchive1700000001000 } from './migrations/1700000001000-CreateRawArchive'
 import { Phase2MediaPipeline1700000002000 } from './migrations/1700000002000-Phase2MediaPipeline'
 import { Phase3Tracking1700000003000 } from './migrations/1700000003000-Phase3Tracking'
 import { Phase4SearchAlerts1700000004000 } from './migrations/1700000004000-Phase4SearchAlerts'
+import { Phase5Harden1700000005000 } from './migrations/1700000005000-Phase5Harden'
+import { Phase5RefreshTokens1700000006000 } from './migrations/1700000006000-Phase5RefreshTokens'
 
 // Load the monorepo-root .env explicitly. dotenv's default looks in process.cwd(),
 // but `pnpm --filter` runs these scripts with cwd set to this package dir, so the
@@ -62,6 +66,8 @@ export const AppDataSource = new DataSource({
     TransactionMessage,
     TransactionStatusHistory,
     Payment,
+    User,
+    AuditLog,
   ],
   migrations: [
     InitWaAuth1700000000000,
@@ -69,6 +75,8 @@ export const AppDataSource = new DataSource({
     Phase2MediaPipeline1700000002000,
     Phase3Tracking1700000003000,
     Phase4SearchAlerts1700000004000,
+    Phase5Harden1700000005000,
+    Phase5RefreshTokens1700000006000,
   ],
   // NEVER turn this on in production — it silently alters your tables.
   // We use explicit migrations instead.

@@ -8,11 +8,17 @@
     }
   },
   "scripts": {
+    "dev": "docker compose up -d && pnpm migration:run && pnpm --parallel --filter @wa/worker --filter @wa/api run dev",
     "api:dev": "pnpm --filter @wa/api dev",
     "api:start": "pnpm --filter @wa/api start",
     "worker:dev": "pnpm --filter @wa/worker dev",
     "worker:backfill-media": "pnpm --filter @wa/worker backfill-media",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "type-check": "node apps/api/node_modules/typescript/bin/tsc -p apps/api/tsconfig.json --noEmit --strict false && node apps/worker/node_modules/typescript/bin/tsc -p apps/worker/tsconfig.json --noEmit --strict false && node packages/entities/node_modules/typescript/bin/tsc -p packages/entities/tsconfig.json --noEmit --strict false && node packages/storage/node_modules/typescript/bin/tsc -p packages/storage/tsconfig.json --noEmit --strict false",
     "migration:run": "pnpm --filter @wa/entities migration:run",
-    "migration:revert": "pnpm --filter @wa/entities migration:revert"
+    "migration:revert": "pnpm --filter @wa/entities migration:revert",
+    "migration:reset": "pnpm --filter @wa/entities schema:reset && pnpm migration:run",
+    "backup:postgres": "pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/backup-postgres.ps1"
   }
 }

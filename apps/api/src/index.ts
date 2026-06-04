@@ -1,37 +1,55 @@
 import 'reflect-metadata'
-import { randomUUID } from 'node:crypto'
+import { createHash, createHmac, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto'
 import { createReadStream, existsSync } from 'node:fs'
 import { extname, join, normalize } from 'node:path'
 import { createServer, IncomingMessage, ServerResponse } from 'node:http'
 import { URL } from 'node:url'
 import IORedis from 'ioredis'
+import QRCode from 'qrcode'
 import { AppDataSource } from '@wa/entities'
 import { storage } from '@wa/storage'
 
-const port = Number(process.env.API_PORT ?? 3000)
+const configuredPort = parsePositiveEnvInt(process.env.API_PORT, 3000)
+const MAX_PORT_FALLBACK = 10
 const publicDir = join(__dirname, '../public')
 
 // Must match the worker's WA_EVENTS_CHANNEL.
 const WA_EVENTS_CHANNEL = 'wa:events'
+const QR_CACHE_TTL_MS = parsePositiveEnvInt(process.env.API_QR_CACHE_TTL_SECONDS, 60) * 1000
 
 // Connected dashboard SSE clients; the Redis subscriber fans events out to them.
 const sseClients = new Set<ServerResponse>()
+const latestQrByAccount = new Map<string, { qr: string; createdAt: string; expiresAt: number }>()
 
-const MESSAGE_STATUSES = ['pending', 'stored', 'skipped', 'failed'] as const
 const TRANSACTION_STATUSES = ['draft', 'pending', 'in_transit', 'completed', 'refunded', 'lost', 'cancelled'] as const
 const TERMINAL_TRANSACTION_STATUSES = new Set(['completed', 'refunded', 'lost', 'cancelled'])
 const DIRECTION_VALUES = ['incoming', 'outgoing'] as const
 const TAG_KINDS = ['role', 'custom'] as const
 const PAYMENT_DIRECTIONS = ['incoming', 'outgoing'] as const
 const ALERT_RULE_KINDS = ['keyword', 'stale_pending', 'no_movement'] as const
-const ALERT_SEVERITIES = ['info', 'warning', 'critical'] as const
 const ALARM_EVAL_INTERVAL_MS = Number.parseInt(process.env.ALERT_EVAL_INTERVAL_MS ?? '60000', 10)
+const USER_ROLES = ['admin', 'staff'] as const
+const ACCESS_TOKEN_COOKIE_NAME = process.env.ACCESS_TOKEN_COOKIE_NAME ?? process.env.AUTH_COOKIE_NAME ?? 'wa_access'
+const REFRESH_TOKEN_COOKIE_NAME = process.env.REFRESH_TOKEN_COOKIE_NAME ?? 'wa_refresh'
+const CSRF_TOKEN_COOKIE_NAME = process.env.CSRF_TOKEN_COOKIE_NAME ?? 'wa_csrf'
+const ACCESS_TOKEN_TTL_SECONDS = parsePositiveEnvInt(process.env.API_ACCESS_TOKEN_TTL_SECONDS, 900)
+const REFRESH_TOKEN_TTL_SECONDS = parsePositiveEnvInt(process.env.API_REFRESH_TOKEN_TTL_SECONDS, 30 * 24 * 3600)
+const ACCESS_TOKEN_SECRET = process.env.API_JWT_ACCESS_SECRET || process.env.API_SESSION_SECRET || process.env.JWT_SECRET || ''
+const REFRESH_TOKEN_SECRET = process.env.API_JWT_REFRESH_SECRET || process.env.API_SESSION_SECRET || process.env.JWT_SECRET || ''
+const CSRF_TOKEN_BYTES = Number.parseInt(process.env.API_CSRF_TOKEN_BYTES ?? '24', 10)
+const SENSITIVE_PASSWORD_MIN_LENGTH = 12
+const PASSWORD_HASH_SEPARATOR = '$'
+const LOGIN_RATE_LIMIT_WINDOW_MS = Number.parseInt(process.env.LOGIN_RATE_LIMIT_WINDOW_MS ?? '60000', 10)
+const LOGIN_RATE_LIMIT_MAX_ATTEMPTS = Number.parseInt(process.env.LOGIN_RATE_LIMIT_MAX_ATTEMPTS ?? '10', 10)
+const MAX_PAGE_SIZE = 200
 const MEILISEARCH_URL = process.env.MEILISEARCH_URL ?? ''
 const MEILISEARCH_API_KEY = process.env.MEILISEARCH_API_KEY ?? ''
 const MEILISEARCH_INDEX = process.env.MEILISEARCH_MESSAGES_INDEX ?? 'messages'
 const ALERT_EVAL_INTERVAL_MS = Number.isFinite(ALARM_EVAL_INTERVAL_MS) && ALARM_EVAL_INTERVAL_MS >= 10_000
   ? ALARM_EVAL_INTERVAL_MS
   : 60_000
+const IS_PRODUCTION = process.env.NODE_ENV === 'production'
+type AlertSeverity = 'info' | 'warning' | 'critical'
 
 type MessageRow = {
   id: string
@@ -113,6 +131,76 @@ type TransactionStatusHistoryRow = {
   changed_at: string
 }
 
+type AuthenticatedUser = {
+  id: string
+  email: string
+  role: (typeof USER_ROLES)[number]
+  name: string
+}
+
+type JwtAccessPayload = {
+  sub: string
+  email: string
+  role: (typeof USER_ROLES)[number]
+  jti: string
+  type: 'access'
+  iat: number
+  exp: number
+}
+
+type JwtRefreshPayload = {
+  sub: string
+  jti: string
+  type: 'refresh'
+  iat: number
+  exp: number
+}
+
+type RefreshSessionRow = {
+  id: string
+  user_id: string
+  token_hash: string
+  csrf_hash: string
+  expires_at: string
+  ip_address_hash: string | null
+  user_agent: string | null
+}
+
+type UserRow = {
+  id: string
+  email: string
+  name: string
+  password_hash: string
+  role: string
+  is_active: boolean
+}
+
+type AccountRow = {
+  id: string
+  label: string | null
+  phoneNumber: string | null
+  status: string
+  lastSeenAt: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+type AuthenticatedRequest = IncomingMessage & {
+  authUser?: AuthenticatedUser
+}
+
+type AuditLogRow = {
+  id: string
+  userId: string | null
+  userEmail: string | null
+  action: string
+  entityType: string
+  entityId: string
+  before: unknown
+  after: unknown
+  createdAt: string
+}
+
 type PaymentRow = {
   id: string
   amount: string
@@ -121,6 +209,11 @@ type PaymentRow = {
   method: string | null
   paid_at: string
   note: string | null
+}
+
+function parsePositiveEnvInt(rawValue: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(rawValue ?? '', 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
 }
 
 async function main() {
@@ -136,9 +229,8 @@ async function main() {
     })
   })
 
-  server.listen(port, () => {
-    console.log(`api listening on http://localhost:${port}`)
-  })
+  const port = await listenWithFallback(server, configuredPort)
+  console.log(`api listening on http://localhost:${port}`)
 
   const shutdown = async () => {
     console.log('shutting down...')
@@ -151,15 +243,81 @@ async function main() {
   process.on('SIGTERM', shutdown)
 }
 
+function listenWithFallback(server: ReturnType<typeof createServer>, startPort: number): Promise<number> {
+  return new Promise((resolve, reject) => {
+    let attempts = 0
+
+    const tryPort = (candidatePort: number) => {
+      const onError = (error: unknown) => {
+        const err = error as { code?: string } & Error
+        if (err.code === 'EADDRINUSE' && attempts < MAX_PORT_FALLBACK - 1) {
+          attempts++
+          const nextPort = startPort + attempts
+          server.removeListener('error', onError)
+          console.warn(`api port ${candidatePort} is in use. switching to ${nextPort}`)
+          tryPort(nextPort)
+          return
+        }
+        reject(err)
+      }
+
+      server.once('error', onError)
+      server.listen(candidatePort, () => {
+        server.removeListener('error', onError)
+        resolve(candidatePort)
+      })
+    }
+
+    tryPort(startPort)
+  })
+}
+
 // Subscribe to worker-published live events and push them to all SSE clients.
 function startEventSubscriber() {
   const url = process.env.REDIS_URL || 'redis://localhost:6379'
   const sub = new IORedis(url, { maxRetriesPerRequest: null })
   sub.on('message', (_channel: string, payload: string) => {
-    publishSseEventRaw(payload)
+    handleWorkerEventPayload(payload)
   })
   sub.on('error', (e: Error) => console.error('redis subscriber error:', e.message))
   sub.subscribe(WA_EVENTS_CHANNEL).catch((e: unknown) => console.error('redis subscribe failed:', e))
+}
+
+function handleWorkerEventPayload(payload: string): void {
+  let event: unknown
+  try {
+    event = JSON.parse(payload)
+  } catch {
+    publishSseEventRaw(payload)
+    return
+  }
+
+  if (isQrEvent(event)) {
+    const createdAt = typeof event.createdAt === 'string' ? event.createdAt : new Date().toISOString()
+    latestQrByAccount.set(event.accountId, {
+      qr: event.qr,
+      createdAt,
+      expiresAt: Date.now() + QR_CACHE_TTL_MS,
+    })
+    publishSseEvent({ type: 'qr_available', accountId: event.accountId, createdAt })
+    return
+  }
+
+  if (isConnectionEvent(event) && event.status === 'connected') {
+    latestQrByAccount.delete(event.accountId)
+  }
+
+  publishSseEventRaw(payload)
+}
+
+function isQrEvent(event: unknown): event is { type: 'qr'; accountId: string; qr: string; createdAt?: string } {
+  const candidate = event as { type?: unknown; accountId?: unknown; qr?: unknown }
+  return candidate?.type === 'qr' && typeof candidate.accountId === 'string' && typeof candidate.qr === 'string'
+}
+
+function isConnectionEvent(event: unknown): event is { type: 'connection'; accountId: string; status: string } {
+  const candidate = event as { type?: unknown; accountId?: unknown; status?: unknown }
+  return candidate?.type === 'connection' && typeof candidate.accountId === 'string' && typeof candidate.status === 'string'
 }
 
 function startAlertEngine() {
@@ -197,6 +355,14 @@ function validateTagKind(kind: string): kind is (typeof TAG_KINDS)[number] {
 
 function toErrorCode(e: unknown): { code: number; error: string } {
   if (e instanceof Error) {
+    if (e.message === 'unauthorized') return { code: 401, error: 'unauthorized' }
+    if (e.message === 'forbidden') return { code: 403, error: 'forbidden' }
+    if (e.message === 'validation_error:too_many_login_attempts') return { code: 429, error: 'too_many_login_attempts' }
+    if (e.message === 'invalid_json') return { code: 400, error: 'invalid_json' }
+    if (e.message === 'auth_token_expired') return { code: 401, error: 'auth_token_expired' }
+    if (e.message === 'auth_secret_missing') return { code: 500, error: 'server_auth_config_missing' }
+    if (e.message === 'invalid_refresh_token') return { code: 401, error: 'invalid_refresh_token' }
+    if (e.message === 'invalid_csrf_token') return { code: 403, error: 'invalid_csrf_token' }
     if (e.message === 'not_found') return { code: 404, error: 'not_found' }
     if (e.message.startsWith('validation_error:')) {
       return { code: 400, error: e.message.replace('validation_error:', '') }
@@ -209,13 +375,26 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   try {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
     const method = req.method ?? 'GET'
+    const authReq = req as AuthenticatedRequest
+    const isApiRoute = url.pathname.startsWith('/api/')
 
     if (url.pathname === '/api/health') {
       sendJson(res, 200, { ok: true })
       return
     }
 
+    if (url.pathname.startsWith('/api/auth')) {
+      await handleAuthRoutes(req, res, url, method)
+      return
+    }
+
+    if (isApiRoute) {
+      const user = await getAuthenticatedUser(req)
+      authReq.authUser = user
+    }
+
     if (url.pathname === '/api/stats') {
+      await requireRole(authReq, ['admin', 'staff'])
       if (method !== 'GET') {
         sendJson(res, 405, { error: 'method_not_allowed' })
         return
@@ -224,14 +403,27 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       return
     }
 
+    if (url.pathname === '/api/qr-code') {
+      await requireRole(authReq, ['admin', 'staff'])
+      if (method !== 'POST') {
+        sendJson(res, 405, { error: 'method_not_allowed' })
+        return
+      }
+      const payload = await readJsonBody(req)
+      sendJson(res, 200, await generateQrCode(payload))
+      return
+    }
+
     if (url.pathname === '/api/alert-rules') {
+      await requireRole(authReq, ['admin', 'staff'])
       if (method === 'GET') {
         sendJson(res, 200, await getAlertRules())
         return
       }
       if (method === 'POST') {
+        await requireRole(authReq, ['admin'])
         const payload = await readJsonBody(req)
-        sendJson(res, 201, await createAlertRule(payload))
+        sendJson(res, 201, await createAlertRule(authReq, payload))
         return
       }
       sendJson(res, 405, { error: 'method_not_allowed' })
@@ -239,11 +431,13 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     }
 
     if (url.pathname.startsWith('/api/alerts')) {
+      await requireRole(authReq, ['admin', 'staff'])
       await handleAlertsRoutes(req, res, url, method)
       return
     }
 
     if (url.pathname === '/api/messages') {
+      await requireRole(authReq, ['admin', 'staff'])
       if (method !== 'GET') {
         sendJson(res, 405, { error: 'method_not_allowed' })
         return
@@ -253,6 +447,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     }
 
     if (url.pathname === '/api/chats') {
+      await requireRole(authReq, ['admin', 'staff'])
       if (method !== 'GET') {
         sendJson(res, 405, { error: 'method_not_allowed' })
         return
@@ -262,6 +457,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     }
 
     if (url.pathname === '/api/stream') {
+      await requireRole(authReq, ['admin', 'staff'])
       if (method !== 'GET') {
         sendJson(res, 405, { error: 'method_not_allowed' })
         return
@@ -271,6 +467,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     }
 
     if (url.pathname.startsWith('/api/media/')) {
+      await requireRole(authReq, ['admin', 'staff'])
       if (method !== 'GET') {
         sendJson(res, 405, { error: 'method_not_allowed' })
         return
@@ -280,18 +477,21 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     }
 
     if (url.pathname.startsWith('/api/transactions')) {
+      await requireRole(authReq, ['admin', 'staff'])
       await handleTransactions(req, res, url, method)
       return
     }
 
     if (url.pathname === '/api/tags') {
+      await requireRole(authReq, ['admin', 'staff'])
       if (method === 'GET') {
         sendJson(res, 200, await getTags())
         return
       }
       if (method === 'POST') {
+        await requireRole(authReq, ['admin', 'staff'])
         const payload = await readJsonBody(req)
-        sendJson(res, 201, await createTag(payload))
+        sendJson(res, 201, await createTag(authReq, payload))
         return
       }
       sendJson(res, 405, { error: 'method_not_allowed' })
@@ -299,7 +499,49 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     }
 
     if (url.pathname.startsWith('/api/contacts/')) {
+      await requireRole(authReq, ['admin', 'staff'])
       await handleContactRoutes(req, res, url, method)
+      return
+    }
+
+    if (url.pathname === '/api/users') {
+      if (method === 'GET') {
+        await requireRole(authReq, ['admin'])
+        sendJson(res, 200, await getUsers(url))
+        return
+      }
+      if (method === 'POST') {
+        await requireRole(authReq, ['admin'])
+        const payload = await readJsonBody(req)
+        sendJson(res, 201, await createUser(authReq, payload))
+        return
+      }
+      sendJson(res, 405, { error: 'method_not_allowed' })
+      return
+    }
+
+    if (url.pathname === '/api/accounts') {
+      if (method === 'GET') {
+        await requireRole(authReq, ['admin', 'staff'])
+        sendJson(res, 200, await getAccounts())
+        return
+      }
+      sendJson(res, 405, { error: 'method_not_allowed' })
+      return
+    }
+
+    if (url.pathname.startsWith('/api/accounts/')) {
+      await handleAccountsRoutes(req, res, url, method)
+      return
+    }
+
+    if (url.pathname === '/api/audit-logs') {
+      if (method !== 'GET') {
+        sendJson(res, 405, { error: 'method_not_allowed' })
+        return
+      }
+      await requireRole(authReq, ['admin'])
+      sendJson(res, 200, await getAuditLogs(url))
       return
     }
 
@@ -319,15 +561,927 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   }
 }
 
+const loginAttempts = new Map<string, { count: number; resetAt: number }>()
+
+async function handleAuthRoutes(req: IncomingMessage, res: ServerResponse, url: URL, method: string): Promise<void> {
+  const path = url.pathname.toLowerCase()
+  const methodUpper = method.toUpperCase()
+  const authReq = req as AuthenticatedRequest
+
+  if (path === '/api/auth/register' && methodUpper === 'POST') {
+    if (!ACCESS_TOKEN_SECRET || !REFRESH_TOKEN_SECRET) {
+      throw new Error('auth_secret_missing')
+    }
+    const body = (await readJsonBody(req)) as Record<string, unknown>
+    const email = String(body.email ?? '').trim().toLowerCase()
+    const name = String(body.name ?? '').trim()
+    const password = String(body.password ?? '')
+
+    if (!email.includes('@')) throw new Error('validation_error:email')
+    if (!name) throw new Error('validation_error:name')
+    if (!password || password.length < SENSITIVE_PASSWORD_MIN_LENGTH) throw new Error('validation_error:password')
+
+    const [countRow] = await AppDataSource.query(`select count(*)::int as count from users`)
+    const existingUsers = Number(countRow?.count ?? 0)
+    if (existingUsers > 0) {
+      throw new Error('forbidden')
+    }
+
+    const id = randomUUID()
+    const passwordHash = hashPassword(password)
+    await AppDataSource.query(
+      `
+        insert into users (id, email, password_hash, name, role, is_active, created_at, updated_at)
+        values ($1,$2,$3,$4,'admin',true, now(), now())
+      `,
+      [id, email, passwordHash, name],
+    )
+
+    const authUser: AuthenticatedUser = {
+      id,
+      email,
+      name,
+      role: 'admin',
+    }
+    await issueAuthCookies(res, authUser, req)
+    sendJson(res, 201, {
+      user: sanitizeUserForClient(authUser),
+      accessTokenExpiresIn: ACCESS_TOKEN_TTL_SECONDS,
+      tokenType: 'Bearer',
+    })
+    return
+  }
+
+  if (path === '/api/auth/register') {
+    sendJson(res, 405, { error: 'method_not_allowed' })
+    return
+  }
+
+  if (path === '/api/auth/me' && method === 'GET') {
+    const user = await getAuthenticatedUser(req)
+    authReq.authUser = user
+    sendJson(res, 200, { user: sanitizeUserForClient(user) })
+    return
+  }
+
+  if (path === '/api/auth/logout' && methodUpper === 'POST') {
+    await revokeCurrentRefreshSession(req)
+    clearAuthCookies(res)
+    sendJson(res, 200, { ok: true })
+    return
+  }
+
+  if (path === '/api/auth/logout-all' && methodUpper === 'POST') {
+    const user = await getAuthenticatedUser(req)
+    await revokeAllRefreshTokensForUser(user.id)
+    clearAuthCookies(res)
+    sendJson(res, 200, { ok: true })
+    return
+  }
+
+  if (path === '/api/auth/refresh' && methodUpper === 'POST') {
+    const { user, accessExpiresAt } = await refreshAccessToken(req, res)
+    sendJson(res, 200, {
+      user: sanitizeUserForClient(user),
+      accessTokenExpiresAt: accessExpiresAt,
+      tokenType: 'Bearer',
+    })
+    return
+  }
+
+  if (path === '/api/auth/login' && methodUpper === 'POST') {
+    if (!ACCESS_TOKEN_SECRET || !REFRESH_TOKEN_SECRET) {
+      throw new Error('auth_secret_missing')
+    }
+    const body = (await readJsonBody(req)) as Record<string, unknown>
+    const ip = req.socket.remoteAddress ?? 'unknown'
+    const rate = loginAttempts.get(ip) ?? { count: 0, resetAt: Date.now() + LOGIN_RATE_LIMIT_WINDOW_MS }
+    if (Date.now() > rate.resetAt) {
+      rate.count = 0
+      rate.resetAt = Date.now() + LOGIN_RATE_LIMIT_WINDOW_MS
+    }
+    if (rate.count >= LOGIN_RATE_LIMIT_MAX_ATTEMPTS) {
+      throw new Error('validation_error:too_many_login_attempts')
+    }
+
+    const email = String(body.email ?? '').trim().toLowerCase()
+    const password = String(body.password ?? '')
+    if (!email || !password) throw new Error('validation_error:credentials')
+
+    const [user] = (await AppDataSource.query(
+      `select id, email, name, role, is_active, password_hash from users where lower(email) = lower($1)`,
+      [email],
+    )) as UserRow[]
+    rate.count += 1
+    loginAttempts.set(ip, rate)
+
+    if (!user || !user.is_active || !verifyPassword(password, user.password_hash)) {
+      throw new Error('unauthorized')
+    }
+    const authUser: AuthenticatedUser = {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      role: isOneOf(user.role, USER_ROLES) ? user.role : 'staff',
+    }
+    await AppDataSource.query(`update users set updated_at = now() where id = $1`, [authUser.id])
+    await issueAuthCookies(res, authUser, req)
+    authReq.authUser = authUser
+    rate.count = 0
+    loginAttempts.set(ip, rate)
+    sendJson(res, 200, {
+      user: sanitizeUserForClient(authUser),
+      accessTokenExpiresIn: ACCESS_TOKEN_TTL_SECONDS,
+      tokenType: 'Bearer',
+    })
+    return
+  }
+
+  if (
+    path === '/api/auth/login' ||
+    path === '/api/auth/me' ||
+    path === '/api/auth/logout' ||
+    path === '/api/auth/refresh' ||
+    path === '/api/auth/logout-all'
+  ) {
+    sendJson(res, 405, { error: 'method_not_allowed' })
+    return
+  }
+
+  sendJson(res, 404, { error: 'not_found' })
+}
+
+async function getAuthenticatedUser(req: IncomingMessage): Promise<AuthenticatedUser> {
+  const token = getAccessToken(req)
+  if (!token) throw new Error('unauthorized')
+  const payload = parseJwtAccessToken(token)
+  const user = await getUserById(payload.sub)
+  if (!user) throw new Error('unauthorized')
+  if (!user.is_active) throw new Error('forbidden')
+
+  return {
+    id: user.id,
+    email: user.email,
+    role: isOneOf(user.role, USER_ROLES) ? user.role : 'staff',
+    name: user.name,
+  }
+}
+
+async function requireRole(req: IncomingMessage, roles: readonly (typeof USER_ROLES)[number][]): Promise<AuthenticatedUser> {
+  const user = await getAuthenticatedUser(req)
+  if (!roles.includes(user.role)) throw new Error('forbidden')
+  ;(req as AuthenticatedRequest).authUser = user
+  return user
+}
+
+function sanitizeUserForClient(user: AuthenticatedUser) {
+  return {
+    id: user.id,
+    email: user.email,
+    name: user.name,
+    role: user.role,
+  }
+}
+
+function getCookieValue(req: IncomingMessage, name: string): string | null {
+  const cookies = parseCookieHeader(req.headers.cookie ?? '')
+  return cookies[name] ?? null
+}
+
+function getAccessToken(req: IncomingMessage): string | null {
+  const cookie = getCookieValue(req, ACCESS_TOKEN_COOKIE_NAME)
+  if (cookie) return cookie
+  const authHeader = req.headers.authorization
+  if (!authHeader) return null
+  const match = /^Bearer\s+(.+)$/.exec(authHeader)
+  return match?.[1] ?? null
+}
+
+function getRefreshToken(req: IncomingMessage): string | null {
+  return getCookieValue(req, REFRESH_TOKEN_COOKIE_NAME)
+}
+
+function getCsrfTokenFromRequest(req: IncomingMessage): string | null {
+  const raw = req.headers['x-csrf-token']
+  if (!raw) return null
+  const candidate = Array.isArray(raw) ? raw[0] : raw
+  if (typeof candidate !== 'string') return null
+  const token = candidate.trim()
+  return token.length > 0 ? token : null
+}
+
+function isBase64Url(value: string): boolean {
+  return /^[A-Za-z0-9_-]+={0,2}$/.test(value)
+}
+
+function parseJwtParts(token: string) {
+  const parts = token.split('.')
+  if (parts.length !== 3) {
+    throw new Error('unauthorized')
+  }
+  if (!parts.every(isBase64Url)) {
+    throw new Error('unauthorized')
+  }
+  return parts
+}
+
+function parseSignedJwt(token: string, secret: string): unknown {
+  if (!secret) {
+    throw new Error('auth_secret_missing')
+  }
+
+  const [headerB64, payloadB64, signatureB64] = parseJwtParts(token)
+  const expectedSig = createHmac('sha256', secret).update(`${headerB64}.${payloadB64}`).digest('base64url')
+  const expectedSigBytes = Buffer.from(expectedSig, 'base64url')
+  const providedSigBytes = Buffer.from(signatureB64, 'base64url')
+  if (expectedSigBytes.length !== providedSigBytes.length || !timingSafeEqual(expectedSigBytes, providedSigBytes)) {
+    throw new Error('unauthorized')
+  }
+
+  let payload: unknown
+  try {
+    payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'))
+  } catch {
+    throw new Error('unauthorized')
+  }
+  return payload
+}
+
+function parseJwtAccessToken(token: string): JwtAccessPayload {
+  const payload = parseSignedJwt(token, ACCESS_TOKEN_SECRET)
+  if (!payload || typeof payload !== 'object') throw new Error('unauthorized')
+  const normalized = payload as Record<string, unknown>
+  if (normalized.type !== 'access') throw new Error('unauthorized')
+  if (typeof normalized.sub !== 'string' || normalized.sub.length < 1) throw new Error('unauthorized')
+  if (typeof normalized.email !== 'string' || !normalized.email) throw new Error('unauthorized')
+  if (!Number.isFinite(normalized.iat as number) || !Number.isFinite(normalized.exp as number)) {
+    throw new Error('unauthorized')
+  }
+  const role = normalized.role
+  if (typeof role !== 'string' || !isOneOf(role, USER_ROLES)) {
+    throw new Error('unauthorized')
+  }
+  const now = Math.floor(Date.now() / 1000)
+  const exp = Number(normalized.exp)
+  if (exp < now) throw new Error('auth_token_expired')
+  if (typeof normalized.jti !== 'string' || !normalized.jti) throw new Error('unauthorized')
+  return {
+    sub: normalized.sub,
+    email: normalized.email,
+    role,
+    jti: normalized.jti,
+    type: 'access',
+    iat: Number(normalized.iat),
+    exp,
+  }
+}
+
+function parseJwtRefreshToken(token: string): JwtRefreshPayload {
+  const payload = parseSignedJwt(token, REFRESH_TOKEN_SECRET)
+  if (!payload || typeof payload !== 'object') throw new Error('unauthorized')
+  const normalized = payload as Record<string, unknown>
+  if (normalized.type !== 'refresh') throw new Error('unauthorized')
+  if (typeof normalized.sub !== 'string' || normalized.sub.length < 1) throw new Error('unauthorized')
+  if (!Number.isFinite(normalized.iat as number) || !Number.isFinite(normalized.exp as number)) {
+    throw new Error('unauthorized')
+  }
+  if (typeof normalized.jti !== 'string' || !normalized.jti) throw new Error('unauthorized')
+  const now = Math.floor(Date.now() / 1000)
+  const exp = Number(normalized.exp)
+  if (exp < now) throw new Error('auth_token_expired')
+  return {
+    sub: normalized.sub,
+    jti: normalized.jti,
+    type: 'refresh',
+    iat: Number(normalized.iat),
+    exp,
+  }
+}
+
+function createSignedJwt(payload: Record<string, unknown>, secret: string): string {
+  if (!secret) {
+    throw new Error('auth_secret_missing')
+  }
+  const header = Buffer.from('{"alg":"HS256","typ":"JWT"}', 'utf8').toString('base64url')
+  const body = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')
+  const signature = createHmac('sha256', secret).update(`${header}.${body}`).digest('base64url')
+  return `${header}.${body}.${signature}`
+}
+
+function createAccessToken(user: AuthenticatedUser): string {
+  const now = Math.floor(Date.now() / 1000)
+  const exp = now + Math.max(ACCESS_TOKEN_TTL_SECONDS, 60)
+  const payload: JwtAccessPayload = {
+    sub: user.id,
+    email: user.email,
+    role: user.role,
+    jti: randomUUID(),
+    type: 'access',
+    iat: now,
+    exp,
+  }
+  return createSignedJwt(payload, ACCESS_TOKEN_SECRET)
+}
+
+function createRefreshToken(user: AuthenticatedUser): string {
+  const now = Math.floor(Date.now() / 1000)
+  const exp = now + Math.max(REFRESH_TOKEN_TTL_SECONDS, 60)
+  const payload: JwtRefreshPayload = {
+    sub: user.id,
+    jti: randomUUID(),
+    type: 'refresh',
+    iat: now,
+    exp,
+  }
+  return createSignedJwt(payload, REFRESH_TOKEN_SECRET)
+}
+
+function generateRandomToken(bytes: number): string {
+  const safeBytes = Number.isFinite(bytes) && bytes > 0 ? bytes : 24
+  return randomBytes(safeBytes).toString('base64url')
+}
+
+function hashToken(raw: string): string {
+  return createHash('sha256').update(raw).digest('base64url')
+}
+
+function buildCookie(name: string, value: string, maxAgeSeconds: number, httpOnly = true): string {
+  const maxAge = Math.max(Math.floor(maxAgeSeconds), 60)
+  const parts = [
+    `${name}=${encodeURIComponent(value)}`,
+    'Path=/',
+    `Max-Age=${maxAge}`,
+    `Expires=${new Date(Date.now() + maxAge * 1000).toUTCString()}`,
+    'SameSite=Strict',
+  ]
+  if (IS_PRODUCTION) parts.push('Secure')
+  if (httpOnly) parts.push('HttpOnly')
+  return parts.join('; ')
+}
+
+function clearCookie(name: string): string {
+  return `${name}=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Strict${IS_PRODUCTION ? '; Secure' : ''}`
+}
+
+async function issueAuthCookies(res: ServerResponse, user: AuthenticatedUser, req: IncomingMessage): Promise<void> {
+  const accessToken = createAccessToken(user)
+  const csrfToken = generateRandomToken(CSRF_TOKEN_BYTES)
+  const refreshSession = await createRefreshSession(user, req, csrfToken)
+
+  res.setHeader('Set-Cookie', [
+    buildCookie(ACCESS_TOKEN_COOKIE_NAME, accessToken, ACCESS_TOKEN_TTL_SECONDS, true),
+    buildCookie(REFRESH_TOKEN_COOKIE_NAME, refreshSession.token, REFRESH_TOKEN_TTL_SECONDS, true),
+    buildCookie(CSRF_TOKEN_COOKIE_NAME, csrfToken, REFRESH_TOKEN_TTL_SECONDS, false),
+  ])
+}
+
+function clearAuthCookies(res: ServerResponse): void {
+  res.setHeader('Set-Cookie', [
+    clearCookie(ACCESS_TOKEN_COOKIE_NAME),
+    clearCookie(REFRESH_TOKEN_COOKIE_NAME),
+    clearCookie(CSRF_TOKEN_COOKIE_NAME),
+  ])
+}
+
+type IssuedRefreshSession = {
+  id: string
+  token: string
+}
+
+async function createRefreshSession(
+  user: AuthenticatedUser,
+  req: IncomingMessage,
+  csrfToken: string,
+): Promise<IssuedRefreshSession> {
+  const now = Date.now()
+  const token = createRefreshToken(user)
+  const tokenPayload = parseJwtRefreshToken(token)
+  const expiresAt = new Date(now + Math.max(REFRESH_TOKEN_TTL_SECONDS, 60) * 1000)
+  const ip = req.socket.remoteAddress
+  const userAgent = typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : null
+  await AppDataSource.query(
+    `
+      insert into refresh_tokens (
+        id,
+        user_id,
+        token_hash,
+        csrf_hash,
+        expires_at,
+        ip_address_hash,
+        user_agent,
+        created_at,
+        updated_at
+      ) values (
+        $1, $2, $3, $4, $5, $6, $7, now(), now()
+      )
+    `,
+    [
+      tokenPayload.jti,
+      user.id,
+      hashToken(token),
+      hashToken(csrfToken),
+      expiresAt,
+      ip ? hashToken(ip) : null,
+      userAgent,
+    ],
+  )
+  return {
+    id: tokenPayload.jti,
+    token,
+  }
+}
+
+async function getRefreshSessionByToken(token: string): Promise<RefreshSessionRow | null> {
+  const [row] = (await AppDataSource.query(
+    `
+      select
+        id,
+        user_id,
+        token_hash,
+        csrf_hash,
+        expires_at,
+        ip_address_hash,
+        user_agent
+      from refresh_tokens
+      where token_hash = $1
+        and revoked_at is null
+        and expires_at > now()
+    `,
+    [hashToken(token)],
+  )) as RefreshSessionRow[]
+  return row ?? null
+}
+
+async function revokeRefreshSession(sessionId: string): Promise<void> {
+  await AppDataSource.query(`update refresh_tokens set revoked_at = now(), updated_at = now() where id = $1`, [sessionId])
+}
+
+async function revokeCurrentRefreshSession(req: IncomingMessage): Promise<void> {
+  const token = getRefreshToken(req)
+  if (!token) return
+  const row = await getRefreshSessionByToken(token)
+  if (!row) return
+  await revokeRefreshSession(row.id)
+}
+
+async function revokeAllRefreshTokensForUser(userId: string): Promise<void> {
+  await AppDataSource.query(`update refresh_tokens set revoked_at = now(), updated_at = now() where user_id = $1 and revoked_at is null`, [userId])
+}
+
+async function refreshAccessToken(req: IncomingMessage, res: ServerResponse): Promise<{ user: AuthenticatedUser; accessExpiresAt: number }> {
+  const refreshToken = getRefreshToken(req)
+  if (!refreshToken) throw new Error('unauthorized')
+  const payload = parseJwtRefreshToken(refreshToken)
+  const session = await getRefreshSessionByToken(refreshToken)
+  if (!session || session.id !== payload.jti) throw new Error('invalid_refresh_token')
+  const csrfToken = getCsrfTokenFromRequest(req)
+  if (!csrfToken || !session.csrf_hash || !validateTokenHash(csrfToken, session.csrf_hash)) {
+    throw new Error('invalid_csrf_token')
+  }
+  if (new Date(session.expires_at).getTime() <= Date.now()) {
+    await revokeRefreshSession(session.id)
+    throw new Error('auth_token_expired')
+  }
+
+  const user = await getUserById(payload.sub)
+  if (!user) throw new Error('unauthorized')
+  if (!user.is_active) {
+    await revokeRefreshSession(session.id)
+    throw new Error('forbidden')
+  }
+
+  await revokeRefreshSession(session.id)
+  const authUser: AuthenticatedUser = {
+    id: user.id,
+    email: user.email,
+    name: user.name,
+    role: isOneOf(user.role, USER_ROLES) ? user.role : 'staff',
+  }
+  const accessExpiresAt = Math.floor(Date.now() / 1000) + Math.max(ACCESS_TOKEN_TTL_SECONDS, 60)
+  await issueAuthCookies(res, authUser, req)
+  return { user: authUser, accessExpiresAt }
+}
+
+function validateTokenHash(rawToken: string, expectedHash: string): boolean {
+  try {
+    return timingSafeEqual(Buffer.from(hashToken(rawToken), 'base64url'), Buffer.from(expectedHash, 'base64url'))
+  } catch {
+    return false
+  }
+}
+
+async function getUserById(id: string) {
+  const [user] = await AppDataSource.query(
+    `select id, email, name, role, is_active, password_hash from users where id = $1`,
+    [id],
+  )
+  return user as (UserRow | undefined)
+}
+
+function parseCookieHeader(raw: string): Record<string, string> {
+  if (!raw) return {}
+  return raw
+    .split(';')
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .reduce((acc, pair) => {
+      const i = pair.indexOf('=')
+      if (i <= 0) return acc
+      acc[pair.slice(0, i)] = decodeURIComponent(pair.slice(i + 1))
+      return acc
+    }, {} as Record<string, string>)
+}
+
+function hashPassword(raw: string): string {
+  const salt = randomBytes(16).toString('hex')
+  const hash = scryptSync(raw, Buffer.from(salt, 'hex'), 64)
+  return `v1${PASSWORD_HASH_SEPARATOR}${salt}${PASSWORD_HASH_SEPARATOR}${hash.toString('base64url')}`
+}
+
+function verifyPassword(raw: string, stored: string): boolean {
+  const [version, salt, expected] = stored.split(PASSWORD_HASH_SEPARATOR)
+  if (version !== 'v1' || !salt || !expected) return false
+  const expectedBytes = Buffer.from(expected, 'base64url')
+  const candidate = scryptSync(raw, Buffer.from(salt, 'hex'), expectedBytes.length)
+  return expectedBytes.length === candidate.length && timingSafeEqual(expectedBytes, candidate)
+}
+
+async function getUsers(url: URL) {
+  const rawLimit = Number(url.searchParams.get('limit') ?? 50)
+  const rawOffset = Number(url.searchParams.get('offset') ?? 0)
+  const limit = Math.min(Math.max(rawLimit || 1, 1), MAX_PAGE_SIZE)
+  const offset = Math.max(rawOffset || 0, 0)
+  const role = (url.searchParams.get('role') ?? '').trim()
+  const activeOnly = url.searchParams.get('isActive')
+  const q = (url.searchParams.get('q') ?? '').trim()
+
+  const params: unknown[] = []
+  const where: string[] = []
+
+  if (role) {
+    if (!isOneOf(role, USER_ROLES)) {
+      throw new Error('validation_error:role')
+    }
+    params.push(role)
+    where.push(`u.role = $${params.length}`)
+  }
+
+  if (activeOnly !== null) {
+    const parsed = parseBoolean(activeOnly)
+    if (parsed === null) throw new Error('validation_error:isActive')
+    params.push(parsed)
+    where.push(`u.is_active = $${params.length}`)
+  }
+
+  if (q) {
+    params.push(`%${q}%`)
+    const i = params.length
+    where.push(`(u.email ilike $${i} or u.name ilike $${i})`)
+  }
+
+  const whereSql = where.length ? `where ${where.join(' and ')}` : ''
+
+  params.push(limit, offset)
+  const rows = (await AppDataSource.query(
+    `
+      select
+        u.id,
+        u.email,
+        u.name,
+        u.role,
+        u.is_active as "isActive",
+        u.created_at as "createdAt",
+        u.updated_at as "updatedAt"
+      from users u
+      ${whereSql}
+      order by u.created_at desc
+      limit $${params.length - 1}
+      offset $${params.length}
+    `,
+    params,
+  )) as {
+    id: string
+    email: string
+    name: string
+    role: string
+    isActive: boolean
+    createdAt: string
+    updatedAt: string
+  }[]
+
+  const [{ total }] = (await AppDataSource.query(
+    `
+      select count(*)::int as total
+      from users u
+      ${whereSql}
+    `,
+    params.slice(0, params.length - 2),
+  )) as Array<{ total: number }>
+
+  return { rows, total: Number(total), limit, offset }
+}
+
+async function createUser(req: IncomingMessage, payload: unknown) {
+  const actor = await requireRole(req as AuthenticatedRequest, ['admin'])
+  const body = (payload ?? {}) as Record<string, unknown>
+  const email = String(body.email ?? '').trim().toLowerCase()
+  const name = String(body.name ?? '').trim()
+  const rawRole = String(body.role ?? '').trim()
+  const rawActive = body.isActive
+
+  const role = isOneOf(rawRole, USER_ROLES) ? rawRole : 'staff'
+  const password = String(body.password ?? '')
+  const isActive = rawActive === undefined ? true : parseBoolean(String(rawActive)) ?? undefined
+
+  if (!email.includes('@')) throw new Error('validation_error:email')
+  if (!name) throw new Error('validation_error:name')
+  if (!password || password.length < SENSITIVE_PASSWORD_MIN_LENGTH) throw new Error('validation_error:password')
+  if (!isOneOf(role, USER_ROLES)) throw new Error('validation_error:role')
+  if (rawActive !== undefined && isActive === undefined) throw new Error('validation_error:isActive')
+
+  const [existing] = (await AppDataSource.query(
+    `select 1 from users where lower(email) = lower($1)`,
+    [email],
+  )) as Array<{ one: number }>
+  if (existing) throw new Error('validation_error:email_exists')
+
+  const id = randomUUID()
+  const passwordHash = hashPassword(password)
+
+  await AppDataSource.query(
+    `
+      insert into users (id, email, password_hash, name, role, is_active, created_at, updated_at)
+      values ($1,$2,$3,$4,$5,$6, now(), now())
+    `,
+    [id, email, passwordHash, name, role, isActive],
+  )
+
+  const [row] = (await AppDataSource.query(
+    `
+      select
+        id,
+        email,
+        name,
+        role,
+        is_active as "isActive",
+        created_at as "createdAt",
+        updated_at as "updatedAt"
+      from users
+      where id = $1
+    `,
+    [id],
+  )) as {
+    id: string
+    email: string
+    name: string
+    role: string
+    isActive: boolean
+    createdAt: string
+    updatedAt: string
+  }[]
+
+      await recordAudit({
+        user: actor,
+        action: 'create_user',
+        entityType: 'user',
+        entityId: id,
+        before: null,
+        after: row[0] ?? null,
+  })
+
+  return row[0]
+}
+
+async function handleAccountsRoutes(req: IncomingMessage, res: ServerResponse, url: URL, method: string): Promise<void> {
+  const parts = url.pathname.split('/').filter(Boolean)
+  const hasWhatsappRoute = parts.length === 4 && parts[1] === 'accounts'
+  if (!hasWhatsappRoute) {
+    sendJson(res, 404, { error: 'not_found' })
+    return
+  }
+
+  const accountId = decodeURIComponent(parts[2] ?? '')
+  const action = parts[3]
+  if (action === 'qr-code') {
+    if (method !== 'POST') {
+      sendJson(res, 405, { error: 'method_not_allowed' })
+      return
+    }
+    await requireRole(req as AuthenticatedRequest, ['admin', 'staff'])
+    sendJson(res, 200, await requestAccountQrCode(accountId))
+    return
+  }
+
+  if (action !== 'whatsapp-number') {
+    sendJson(res, 404, { error: 'not_found' })
+    return
+  }
+
+  if (method !== 'POST') {
+    sendJson(res, 405, { error: 'method_not_allowed' })
+    return
+  }
+
+  const actor = await requireRole(req as AuthenticatedRequest, ['admin'])
+  const body = (await readJsonBody(req)) as Record<string, unknown>
+  const rawPhoneNumber = String(body.phoneNumber ?? body.phone_number ?? '').trim()
+  const phoneNumber = normalizePhoneNumber(rawPhoneNumber)
+  if (!phoneNumber) {
+    throw new Error('validation_error:phone_number')
+  }
+
+  const [existing] = (await AppDataSource.query(
+    `select id, coalesce(label, id) as label, phone_number as "phoneNumber", status, last_seen_at as "lastSeenAt"
+     from accounts
+     where id = $1`,
+    [accountId],
+  )) as Array<AccountRow>
+  if (!existing) {
+    throw new Error('not_found')
+  }
+
+  await AppDataSource.query(
+    `update accounts set phone_number = $1, updated_at = now() where id = $2`,
+    [phoneNumber, existing.id],
+  )
+
+  const [updated] = (await AppDataSource.query(
+    `select id, label, phone_number as "phoneNumber", status, last_seen_at as "lastSeenAt", created_at as "createdAt", updated_at as "updatedAt"
+     from accounts
+     where id = $1`,
+    [accountId],
+  )) as AccountRow[]
+
+  await recordAudit({
+    user: actor,
+    action: 'update_account_phone_number',
+    entityType: 'account',
+    entityId: accountId,
+    before: existing,
+    after: updated,
+  })
+
+  sendJson(res, 200, updated)
+}
+
+async function requestAccountQrCode(accountId: string) {
+  const [account] = (await AppDataSource.query(
+    `select id, coalesce(label, id) as label, status
+     from accounts
+     where id = $1`,
+    [accountId],
+  )) as Array<{ id: string; label: string; status: string }>
+  if (!account) {
+    throw new Error('not_found')
+  }
+
+  if (account.status === 'connected') {
+    latestQrByAccount.delete(accountId)
+    return {
+      accountId,
+      status: 'connected',
+      qr: null,
+      createdAt: null,
+    }
+  }
+
+  const cached = getCachedQr(accountId)
+  return {
+    accountId,
+    status: cached ? 'ready' : 'preparing',
+    qr: cached?.qr ?? null,
+    createdAt: cached?.createdAt ?? null,
+  }
+}
+
+function getCachedQr(accountId: string): { qr: string; createdAt: string } | null {
+  const cached = latestQrByAccount.get(accountId)
+  if (!cached) return null
+  if (cached.expiresAt <= Date.now()) {
+    latestQrByAccount.delete(accountId)
+    return null
+  }
+  return { qr: cached.qr, createdAt: cached.createdAt }
+}
+
+async function getAccounts() {
+  const rows = (await AppDataSource.query(
+    `select id, coalesce(label, id) as label, phone_number as "phoneNumber", status, last_seen_at as "lastSeenAt", created_at as "createdAt", updated_at as "updatedAt"
+     from accounts
+     order by id`,
+  )) as AccountRow[]
+  return { rows }
+}
+
+function normalizePhoneNumber(raw: string): string | null {
+  const cleaned = raw.replace(/[().\s-]/g, '')
+  if (!/^\+?\d{7,24}$/.test(cleaned)) {
+    return null
+  }
+  return cleaned
+}
+
+async function getAuditLogs(url: URL) {
+  const rawLimit = Number(url.searchParams.get('limit') ?? 50)
+  const rawOffset = Number(url.searchParams.get('offset') ?? 0)
+  const action = (url.searchParams.get('action') ?? '').trim()
+  const entityType = (url.searchParams.get('entityType') ?? '').trim()
+  const entityId = (url.searchParams.get('entityId') ?? '').trim()
+  const userId = (url.searchParams.get('userId') ?? '').trim()
+  const limit = Math.min(Math.max(rawLimit || 1, 1), MAX_PAGE_SIZE)
+  const offset = Math.max(rawOffset || 0, 0)
+
+  const params: unknown[] = []
+  const where: string[] = []
+
+  if (action) {
+    params.push(action)
+    where.push(`al.action = $${params.length}`)
+  }
+  if (entityType) {
+    params.push(entityType)
+    where.push(`al.entity_type = $${params.length}`)
+  }
+  if (entityId) {
+    params.push(entityId)
+    where.push(`al.entity_id = $${params.length}`)
+  }
+  if (userId) {
+    params.push(userId)
+    where.push(`al.user_id = $${params.length}`)
+  }
+
+  const whereSql = where.length ? `where ${where.join(' and ')}` : ''
+
+  params.push(limit, offset)
+  const rows = (await AppDataSource.query(
+    `
+      select
+        al.id,
+        al.user_id as "userId",
+        u.email as "userEmail",
+        al.action,
+        al.entity_type as "entityType",
+        al.entity_id as "entityId",
+        al.before,
+        al.after,
+        al.created_at as "createdAt"
+      from audit_log al
+      left join users u on u.id = al.user_id
+      ${whereSql}
+      order by al.created_at desc
+      limit $${params.length - 1}
+      offset $${params.length}
+    `,
+    params,
+  )) as AuditLogRow[]
+
+  const [{ total }] = (await AppDataSource.query(
+    `
+      select count(*)::int as total
+      from audit_log al
+      ${whereSql}
+    `,
+    params.slice(0, params.length - 2),
+  )) as Array<{ total: number }>
+
+  return { rows, total: Number(total), limit, offset }
+}
+
+async function recordAudit(input: {
+  user: AuthenticatedUser
+  action: string
+  entityType: string
+  entityId: string
+  before: unknown
+  after: unknown
+}) {
+  await AppDataSource.query(
+    `
+      insert into audit_log (id, user_id, action, entity_type, entity_id, before, after)
+      values ($1,$2,$3,$4,$5,$6,$7)
+    `,
+    [randomUUID(), input.user.id, input.action, input.entityType, input.entityId, input.before ?? null, input.after ?? null],
+  )
+}
+
+function parseBoolean(raw: string): boolean | undefined {
+  const normalized = raw.trim().toLowerCase()
+  if (['1', 'true', 'yes', 'y', 'on'].includes(normalized)) return true
+  if (['0', 'false', 'no', 'n', 'off'].includes(normalized)) return false
+  return undefined
+}
+
 async function handleTransactions(req: IncomingMessage, res: ServerResponse, url: URL, method: string): Promise<void> {
   if (url.pathname === '/api/transactions') {
+    await requireRole(req as AuthenticatedRequest, ['admin', 'staff'])
     if (method === 'GET') {
       sendJson(res, 200, await getTransactions(url))
       return
     }
     if (method === 'POST') {
       const payload = await readJsonBody(req)
-      sendJson(res, 201, await createTransaction(payload))
+      sendJson(res, 201, await createTransaction(req, payload))
       return
     }
     sendJson(res, 405, { error: 'method_not_allowed' })
@@ -356,8 +1510,9 @@ async function handleTransactions(req: IncomingMessage, res: ServerResponse, url
       sendJson(res, 405, { error: 'method_not_allowed' })
       return
     }
+    await requireRole(req as AuthenticatedRequest, ['admin', 'staff'])
     const payload = await readJsonBody(req)
-    sendJson(res, 201, await linkMessageToTransaction(id, payload))
+    sendJson(res, 201, await linkMessageToTransaction(req, id, payload))
     return
   }
 
@@ -367,8 +1522,9 @@ async function handleTransactions(req: IncomingMessage, res: ServerResponse, url
       return
     }
     if (method === 'POST') {
+      await requireRole(req as AuthenticatedRequest, ['admin', 'staff'])
       const payload = await readJsonBody(req)
-      sendJson(res, 201, await createPayment(id, payload))
+      sendJson(res, 201, await createPayment(req, id, payload))
       return
     }
     sendJson(res, 405, { error: 'method_not_allowed' })
@@ -380,8 +1536,9 @@ async function handleTransactions(req: IncomingMessage, res: ServerResponse, url
       sendJson(res, 405, { error: 'method_not_allowed' })
       return
     }
+    await requireRole(req as AuthenticatedRequest, ['admin', 'staff'])
     const payload = await readJsonBody(req)
-    sendJson(res, 200, await updateTransactionStatus(id, payload))
+    sendJson(res, 200, await updateTransactionStatus(req, id, payload))
     return
   }
 
@@ -403,13 +1560,15 @@ async function handleContactRoutes(req: IncomingMessage, res: ServerResponse, ur
   }
 
   if (method === 'GET') {
+    await requireRole(req as AuthenticatedRequest, ['admin', 'staff'])
     sendJson(res, 200, await getContactTags(contactId))
     return
   }
 
   if (method === 'POST') {
+    await requireRole(req as AuthenticatedRequest, ['admin', 'staff'])
     const payload = await readJsonBody(req)
-    sendJson(res, 201, await addContactTag(contactId, payload))
+    sendJson(res, 201, await addContactTag(req, contactId, payload))
     return
   }
 
@@ -425,7 +1584,11 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   if (chunks.length === 0) return {}
   const raw = Buffer.concat(chunks).toString('utf8').trim()
   if (!raw) return {}
-  return JSON.parse(raw)
+  try {
+    return JSON.parse(raw)
+  } catch {
+    throw new Error('invalid_json')
+  }
 }
 
 // SSE: hold the connection open, register it, and let the Redis subscriber push
@@ -606,6 +1769,26 @@ async function getChats() {
   return { rows }
 }
 
+async function generateQrCode(payload: unknown): Promise<{ svg: string }> {
+  const body = (payload ?? {}) as Record<string, unknown>
+  const text = typeof body.text === 'string' ? body.text : ''
+  if (!text) throw new Error('validation_error:qr_text')
+  if (text.length > 4096) throw new Error('validation_error:qr_text_too_long')
+
+  const svg = await QRCode.toString(text, {
+    type: 'svg',
+    width: 240,
+    margin: 2,
+    errorCorrectionLevel: 'M',
+    color: {
+      dark: '#17211c',
+      light: '#ffffff',
+    },
+  })
+
+  return { svg }
+}
+
 async function handleAlertsRoutes(
   req: IncomingMessage,
   res: ServerResponse,
@@ -742,7 +1925,8 @@ function parseAlertRuleKind(kind: string): (typeof ALERT_RULE_KINDS)[number] | n
   return isOneOf(kind, ALERT_RULE_KINDS) ? kind : null
 }
 
-async function createAlertRule(payload: unknown) {
+async function createAlertRule(req: IncomingMessage, payload: unknown) {
+  const actor = await requireRole(req as AuthenticatedRequest, ['admin'])
   const body = (payload ?? {}) as Record<string, unknown>
   const name = String(body.name ?? '').trim() || 'Untitled rule'
   const rawKind = String(body.kind ?? '').trim()
@@ -780,6 +1964,15 @@ async function createAlertRule(payload: unknown) {
     `,
     [id],
   )) as AlertRuleRow[]
+
+  await recordAudit({
+    user: actor,
+    action: 'create_alert_rule',
+    entityType: 'alert_rule',
+    entityId: id,
+    before: null,
+    after: row[0] ?? null,
+  })
 
   return row
 }
@@ -953,7 +2146,7 @@ async function createNotification(
   options: {
     alertEntityType: string
     alertEntityId: string
-    severity: (typeof ALERT_SEVERITIES)[number]
+    severity: AlertSeverity
     title: string
     details: Record<string, unknown>
   },
@@ -1272,7 +2465,8 @@ async function getTransactionById(id: string) {
   return { ...row, message_rows: messageRows, history, payments }
 }
 
-async function createTransaction(payload: unknown) {
+async function createTransaction(req: IncomingMessage, payload: unknown) {
+  const actor = await requireRole(req as AuthenticatedRequest, ['admin', 'staff'])
   const body = (payload ?? {}) as Record<string, unknown>
   const direction = String(body.direction ?? '').trim()
   const productText = body.productText ?? body.product_text
@@ -1286,7 +2480,6 @@ async function createTransaction(payload: unknown) {
   const quantity = normalizeNumeric(body.quantity)
   const amount = normalizeNumeric(body.amount)
   const notes = typeof body.notes === 'string' && body.notes.trim() ? body.notes.trim() : null
-  const changedByUserId = typeof body.changedByUserId === 'string' ? body.changedByUserId : null
 
   if (!validateDirection(direction)) throw new Error('validation_error:direction')
   if (!fromContactId) throw new Error('validation_error:fromContactId')
@@ -1317,7 +2510,7 @@ async function createTransaction(payload: unknown) {
       amount,
       currency,
       status,
-      changedByUserId,
+      actor.id,
       openedAt,
       notes,
     ],
@@ -1328,13 +2521,34 @@ async function createTransaction(payload: unknown) {
       insert into transaction_status_history (id, transaction_id, from_status, to_status, changed_by_user_id, note, changed_at)
       values ($1, $2, null, $3, $4, $5, now())
     `,
-    [randomUUID(), id, status, changedByUserId, body.note ?? null],
+    [randomUUID(), id, status, actor.id, body.note ?? null],
   )
+
+  await recordAudit({
+    user: actor,
+    action: 'create_transaction',
+    entityType: 'transaction',
+    entityId: id,
+    before: null,
+    after: {
+      direction,
+      fromContactId,
+      toContactId,
+      productText: productText ?? null,
+      quantity,
+      amount,
+      currency,
+      status,
+      notes,
+      openedByUserId: actor.id,
+    },
+  })
 
   return getTransactionById(id)
 }
 
-async function linkMessageToTransaction(transactionId: string, payload: unknown) {
+async function linkMessageToTransaction(req: IncomingMessage, transactionId: string, payload: unknown) {
+  const actor = await requireRole(req as AuthenticatedRequest, ['admin', 'staff'])
   const body = (payload ?? {}) as Record<string, unknown>
   const messageId = String(body.messageId ?? body.message_id ?? '')
 
@@ -1354,18 +2568,29 @@ async function linkMessageToTransaction(transactionId: string, payload: unknown)
     [transactionId, messageId],
   )
 
+  await recordAudit({
+    user: actor,
+    action: 'link_transaction_message',
+    entityType: 'transaction',
+    entityId: transactionId,
+    before: null,
+    after: { messageId },
+  })
+
   return { ok: true, transaction_id: transactionId, message_id: messageId }
 }
 
-async function updateTransactionStatus(transactionId: string, payload: unknown) {
+async function updateTransactionStatus(req: IncomingMessage, transactionId: string, payload: unknown) {
+  const actor = await requireRole(req as AuthenticatedRequest, ['admin', 'staff'])
   const body = (payload ?? {}) as Record<string, unknown>
   const rawStatus = String(body.status ?? '')
   if (!validateStatus(rawStatus)) throw new Error('validation_error:status')
 
   const note = typeof body.note === 'string' ? body.note.trim() : null
-  const changedByUserId = typeof body.changedByUserId === 'string' ? body.changedByUserId : null
-
-  const [current] = await AppDataSource.query(`select status from transactions where id = $1`, [transactionId])
+  const [current] = await AppDataSource.query(
+    `select status from transactions where id = $1`,
+    [transactionId],
+  ) as Array<{ status: string }>
   if (!current) throw new Error('not_found')
   if (current.status === rawStatus) return getTransactionById(transactionId)
 
@@ -1390,8 +2615,17 @@ async function updateTransactionStatus(transactionId: string, payload: unknown) 
         id, transaction_id, from_status, to_status, changed_by_user_id, note, changed_at
       ) values ($1, $2, $3, $4, $5, $6, now())
     `,
-    [randomUUID(), transactionId, current.status, rawStatus, changedByUserId, note],
+    [randomUUID(), transactionId, current.status, rawStatus, actor.id, note],
   )
+
+  await recordAudit({
+    user: actor,
+    action: 'update_transaction_status',
+    entityType: 'transaction',
+    entityId: transactionId,
+    before: { status: current.status },
+    after: { status: rawStatus },
+  })
 
   return getTransactionById(transactionId)
 }
@@ -1405,7 +2639,8 @@ async function getTags() {
   return { rows }
 }
 
-async function createTag(payload: unknown) {
+async function createTag(req: IncomingMessage, payload: unknown) {
+  const actor = await requireRole(req as AuthenticatedRequest, ['admin', 'staff'])
   const body = (payload ?? {}) as Record<string, unknown>
   const name = String(body.name ?? '').trim()
   const kind = String(body.kind ?? 'custom').trim()
@@ -1427,6 +2662,16 @@ async function createTag(payload: unknown) {
     `insert into tags (id, name, kind, color) values ($1, $2, $3, $4)`,
     [id, name, kind, color],
   )
+
+  await recordAudit({
+    user: actor,
+    action: 'create_tag',
+    entityType: 'tag',
+    entityId: id,
+    before: null,
+    after: { name, kind, color },
+  })
+
   return { id, name, kind, color }
 }
 
@@ -1454,7 +2699,8 @@ async function getPaymentsByTransaction(transactionId: string) {
   return { rows, total: rows.length }
 }
 
-async function createPayment(transactionId: string, payload: unknown) {
+async function createPayment(req: IncomingMessage, transactionId: string, payload: unknown) {
+  const actor = await requireRole(req as AuthenticatedRequest, ['admin', 'staff'])
   const body = (payload ?? {}) as Record<string, unknown>
   const amount = normalizeNumeric(body.amount)
   const currency = String(body.currency ?? 'USD').trim().toUpperCase()
@@ -1499,6 +2745,15 @@ async function createPayment(transactionId: string, payload: unknown) {
     [id],
   )) as PaymentRow[]
 
+  await recordAudit({
+    user: actor,
+    action: 'create_payment',
+    entityType: 'payment',
+    entityId: id,
+    before: null,
+    after: payment[0] ?? null,
+  })
+
   return payment
 }
 
@@ -1520,7 +2775,8 @@ async function getContactTags(contactId: string) {
   return { rows }
 }
 
-async function addContactTag(contactId: string, payload: unknown) {
+async function addContactTag(req: IncomingMessage, contactId: string, payload: unknown) {
+  const actor = await requireRole(req as AuthenticatedRequest, ['admin', 'staff'])
   const body = (payload ?? {}) as Record<string, unknown>
   const requestedTagId = typeof body.tagId === 'string' ? body.tagId.trim() : ''
 
@@ -1559,6 +2815,16 @@ async function addContactTag(contactId: string, payload: unknown) {
   )
 
   const [row] = await AppDataSource.query(`select id, name, kind, color from tags where id = $1`, [tagId])
+
+  await recordAudit({
+    user: actor,
+    action: 'add_contact_tag',
+    entityType: 'contact',
+    entityId: contactId,
+    before: null,
+    after: { tagId },
+  })
+
   return row
 }
 
@@ -1587,14 +2853,36 @@ async function serveStatic(pathname: string, res: ServerResponse): Promise<void>
     return
   }
 
+  await serveFile(target, res, 'no-cache')
+}
+
+async function serveFile(target: string, res: ServerResponse, cacheControl: string): Promise<void> {
+  if (!existsSync(target)) {
+    sendJson(res, 404, { error: 'not_found' })
+    return
+  }
+
+  res.setHeader('Cache-Control', cacheControl)
+  setSecurityHeaders(res)
   res.setHeader('content-type', contentType(target))
   createReadStream(target).pipe(res)
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  setSecurityHeaders(res)
   res.statusCode = status
   res.setHeader('content-type', 'application/json; charset=utf-8')
+  res.setHeader('Cache-Control', 'no-store')
   res.end(JSON.stringify(body))
+}
+
+function setSecurityHeaders(res: ServerResponse): void {
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  res.setHeader('X-Frame-Options', 'DENY')
+  res.setHeader('Referrer-Policy', 'no-referrer')
+  if (IS_PRODUCTION) {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
+  }
 }
 
 function contentType(path: string): string {

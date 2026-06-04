@@ -19,7 +19,16 @@ const CHAT_NS = 'chat'
 const MESSAGE_NS = 'message'
 const MEDIA_NS = 'media'
 
-type MessageContent = Record<string, any>
+type MessageContent = NonNullable<proto.IWebMessageInfo['message']>
+type MessageMedia = {
+  mimetype?: string | null
+  fileLength?: unknown
+  seconds?: unknown
+  width?: unknown
+  height?: unknown
+  fileName?: string | null
+  fileSha256?: unknown
+}
 
 // A newly-stored message + any media that needs downloading. wa-connection turns
 // these into queue jobs and SSE events.
@@ -89,7 +98,7 @@ async function persistOneMessage(
 
   const chatId = stableUuid(CHAT_NS, remoteJid)
   const chatType = remoteJid.endsWith('@g.us') ? 'group' : 'dm'
-  const content = unwrapMessageContent(msg.message as MessageContent | undefined)
+  const content = unwrapMessageContent(msg.message)
   const messageType = classifyMessage(content)
   const messageId = stableUuid(MESSAGE_NS, `${accountId}:${waMessageId}`)
   const senderJid = getSenderJid(msg, remoteJid, chatType)
@@ -280,16 +289,19 @@ function extractMedia(content: MessageContent) {
 
   return specs
     .filter(([, value]) => Boolean(value))
-    .map(([type, value]) => ({
-      type,
-      mime: value.mimetype ?? null,
-      sizeBytes: toDecimalString(value.fileLength),
-      durationSeconds: toDecimalString(value.seconds),
-      width: toNullableNumber(value.width),
-      height: toNullableNumber(value.height),
-      originalFilename: value.fileName ?? null,
-      sha256: toHex(value.fileSha256),
-    }))
+    .map(([type, value]) => {
+      const media = value as MessageMedia
+      return {
+        type,
+        mime: media.mimetype ?? null,
+        sizeBytes: toDecimalString(media.fileLength),
+        durationSeconds: toDecimalString(media.seconds),
+        width: toNullableNumber(media.width),
+        height: toNullableNumber(media.height),
+        originalFilename: media.fileName ?? null,
+        sha256: toHex(media.fileSha256),
+      }
+    })
 }
 
 function toMessageDate(value: proto.IWebMessageInfo['messageTimestamp']): Date | null {

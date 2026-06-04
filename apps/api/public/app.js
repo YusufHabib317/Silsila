@@ -25,13 +25,42 @@ const state = {
 
 const TRANSACTION_STATUSES = ['draft', 'pending', 'in_transit', 'completed', 'refunded', 'lost', 'cancelled']
 
+const stateAuth = {
+  user: null,
+  loaded: false,
+  eventSource: null,
+  appStarted: false,
+}
+
 const els = {
+  authShell: document.getElementById('authShell'),
+  appShell: document.getElementById('appShell'),
+  bootShell: document.getElementById('bootShell'),
+  bootMessage: document.getElementById('bootMessage'),
+  loginForm: document.getElementById('loginForm'),
+  loginEmail: document.getElementById('loginEmail'),
+  loginPassword: document.getElementById('loginPassword'),
+  loginSubmit: document.getElementById('loginSubmit'),
+  showRegisterButton: document.getElementById('showRegisterButton'),
+  showLoginButton: document.getElementById('showLoginButton'),
+  registerForm: document.getElementById('registerForm'),
+  registerName: document.getElementById('registerName'),
+  registerEmail: document.getElementById('registerEmail'),
+  registerPassword: document.getElementById('registerPassword'),
+  registerPasswordConfirm: document.getElementById('registerPasswordConfirm'),
+  registerSubmit: document.getElementById('registerSubmit'),
+  authError: document.getElementById('authError'),
+  loggedUser: document.getElementById('loggedUser'),
+  logoutButton: document.getElementById('logoutButton'),
   health: document.getElementById('health'),
   messagesCount: document.getElementById('messagesCount'),
   chatsCount: document.getElementById('chatsCount'),
   contactsCount: document.getElementById('contactsCount'),
   mediaCount: document.getElementById('mediaCount'),
   transactionsCount: document.getElementById('transactionsCount'),
+  pendingTransactionsCount: document.getElementById('pendingTransactionsCount'),
+  unreadAlertsCount: document.getElementById('unreadAlertsCount'),
+  criticalAlertsCount: document.getElementById('criticalAlertsCount'),
   chatList: document.getElementById('chatList'),
   rows: document.getElementById('messageRows'),
   searchForm: document.getElementById('searchForm'),
@@ -80,13 +109,472 @@ const els = {
   alertRuleThreshold: document.getElementById('alertRuleThreshold'),
   alertRuleCooldown: document.getElementById('alertRuleCooldown'),
   alertRuleKeyword: document.getElementById('alertRuleKeyword'),
+  accountSelect: document.getElementById('accountSelect'),
+  accountPhoneInput: document.getElementById('accountPhoneInput'),
+  registerWhatsappForm: document.getElementById('registerWhatsappForm'),
+  requestQrButton: document.getElementById('requestQrButton'),
+  accountActionMessage: document.getElementById('accountActionMessage'),
+  accountQrPanel: document.getElementById('accountQrPanel'),
+  accountQrStatus: document.getElementById('accountQrStatus'),
+  accountQrImage: document.getElementById('accountQrImage'),
+  accountList: document.getElementById('accountList'),
+  toastViewport: document.getElementById('toastViewport'),
 }
 
-async function api(path, options = {}) {
-  const isGet = (options.method ?? 'GET') === 'GET'
-  const fetchOptions = { ...options, headers: { ...options.headers } }
+const accountsState = { rows: [] }
+const pendingQrCodes = new Map()
+const renderedQrImages = new Map()
+const qrRequestState = {
+  accountId: '',
+  deadline: 0,
+  timer: null,
+  inFlight: false,
+}
+const QR_REQUEST_POLL_MS = 2000
+const QR_REQUEST_TIMEOUT_MS = 45000
+let toastId = 0
+let liveEventToastTimer = null
+const liveEventCounts = {
+  message: 0,
+  media: 0,
+  alert: 0,
+}
 
-  if (!isGet && options.body && !fetchOptions.headers['content-type']) {
+function showToast(message, type = 'info', options = {}) {
+  if (!message || !els.toastViewport) return
+
+  const toast = document.createElement('div')
+  const id = `toast-${++toastId}`
+  const duration = Number.isFinite(options.duration) ? options.duration : 4200
+  toast.id = id
+  toast.className = `toast ${type}`
+  toast.setAttribute('role', type === 'error' ? 'alert' : 'status')
+
+  const messageEl = document.createElement('span')
+  messageEl.textContent = message
+
+  const closeButton = document.createElement('button')
+  closeButton.type = 'button'
+  closeButton.className = 'toastClose'
+  closeButton.setAttribute('aria-label', 'Dismiss notification')
+  closeButton.textContent = 'x'
+  closeButton.addEventListener('click', () => removeToast(toast))
+
+  toast.append(messageEl, closeButton)
+  els.toastViewport.appendChild(toast)
+  window.requestAnimationFrame(() => toast.classList.add('visible'))
+
+  if (duration > 0) {
+    window.setTimeout(() => removeToast(toast), duration)
+  }
+}
+
+function removeToast(toast) {
+  if (!toast || !toast.parentElement) return
+  toast.classList.remove('visible')
+  window.setTimeout(() => toast.remove(), 180)
+}
+
+function queueLiveEventToast(type) {
+  if (!Object.prototype.hasOwnProperty.call(liveEventCounts, type)) return
+  liveEventCounts[type] += 1
+  if (liveEventToastTimer) return
+
+  liveEventToastTimer = window.setTimeout(() => {
+    liveEventToastTimer = null
+    const parts = []
+    if (liveEventCounts.message) parts.push(`${formatNumber(liveEventCounts.message)} message${liveEventCounts.message === 1 ? '' : 's'}`)
+    if (liveEventCounts.media) parts.push(`${formatNumber(liveEventCounts.media)} media item${liveEventCounts.media === 1 ? '' : 's'}`)
+    if (liveEventCounts.alert) parts.push(`${formatNumber(liveEventCounts.alert)} alert${liveEventCounts.alert === 1 ? '' : 's'}`)
+    const hasAlert = liveEventCounts.alert > 0
+    liveEventCounts.message = 0
+    liveEventCounts.media = 0
+    liveEventCounts.alert = 0
+    if (parts.length) {
+      showToast(`Live update: ${parts.join(', ')}`, hasAlert ? 'warning' : 'info', { duration: 3200 })
+    }
+  }, 700)
+}
+
+function isAuthError(error) {
+  return error instanceof Error && error.message === 'unauthorized'
+}
+
+function getErrorMessage(error, fallback = 'Something went wrong.') {
+  return error instanceof Error ? error.message : fallback
+}
+
+function showAuthForm(message = '') {
+  if (els.bootShell) {
+    els.bootShell.classList.add('hidden')
+  }
+  if (els.authShell) {
+    els.authShell.classList.remove('hidden')
+  }
+  if (els.appShell) {
+    els.appShell.classList.add('hidden')
+  }
+  if (els.authError && message) {
+    els.authError.textContent = message
+  }
+}
+
+function setAuthMode(mode) {
+  if (!els.loginForm || !els.registerForm || !els.showRegisterButton || !els.showLoginButton) return
+  const isLogin = mode === 'login'
+
+  els.loginForm.classList.toggle('hidden', !isLogin)
+  els.showRegisterButton.classList.toggle('hidden', !isLogin)
+  els.registerForm.classList.toggle('hidden', isLogin)
+  els.showLoginButton.classList.toggle('hidden', isLogin)
+  if (!isLogin) {
+    if (els.registerName) els.registerName.focus()
+  } else if (els.loginEmail) {
+    els.loginEmail.focus()
+  }
+}
+
+function showDashboard() {
+  if (els.bootShell) {
+    els.bootShell.classList.add('hidden')
+  }
+  if (els.authShell) {
+    els.authShell.classList.add('hidden')
+  }
+  if (els.appShell) {
+    els.appShell.classList.remove('hidden')
+  }
+  if (els.authError) {
+    els.authError.textContent = ''
+  }
+}
+
+function showBootstrap(message = 'Checking your session...') {
+  if (els.authShell) {
+    els.authShell.classList.add('hidden')
+  }
+  if (els.appShell) {
+    els.appShell.classList.add('hidden')
+  }
+  if (els.bootMessage && message) {
+    els.bootMessage.textContent = message
+  }
+  if (els.bootShell) {
+    els.bootShell.classList.remove('hidden')
+  }
+}
+
+function setLoggedUser(user) {
+  if (!els.loggedUser) return
+  const name = user?.name ? `Signed in as ${user.name}` : 'Signed in'
+  const role = user?.role ? ` (${user.role})` : ''
+  els.loggedUser.textContent = `${name}${role}`
+}
+
+function handleAuthExpiration(message = 'Session expired, please sign in again.') {
+  stateAuth.user = null
+  stateAuth.appStarted = false
+  pendingQrCodes.clear()
+  renderedQrImages.clear()
+  resetQrRequestState()
+  clearAccountQrView()
+  stopLiveUpdates()
+  if (els.loginEmail) {
+    els.loginEmail.value = ''
+  }
+  if (els.loginPassword) {
+    els.loginPassword.value = ''
+  }
+  showAuthForm(message)
+}
+
+function clearActionMessage() {
+  if (els.accountActionMessage) {
+    els.accountActionMessage.textContent = ''
+  }
+}
+
+function setActionMessage(message, type = 'info') {
+  if (els.accountActionMessage) {
+    els.accountActionMessage.textContent = message
+  }
+  showToast(message, type)
+}
+
+function clearQrRequestTimer() {
+  if (qrRequestState.timer) {
+    window.clearTimeout(qrRequestState.timer)
+    qrRequestState.timer = null
+  }
+}
+
+function resetQrRequestState() {
+  clearQrRequestTimer()
+  qrRequestState.accountId = ''
+  qrRequestState.deadline = 0
+  qrRequestState.inFlight = false
+  syncQrRequestButton()
+}
+
+function syncQrRequestButton() {
+  if (!els.requestQrButton) return
+  const account = getSelectedAccount()
+  const isBusy = qrRequestState.inFlight || (account?.id && qrRequestState.accountId === account.id && !!qrRequestState.timer)
+  els.requestQrButton.disabled = !account || account.status === 'connected' || !!isBusy
+  els.requestQrButton.textContent = isBusy ? 'Preparing...' : account?.status === 'connected' ? 'Connected' : 'Request QR'
+}
+
+function getSelectedAccountId() {
+  return els.accountSelect?.value || ''
+}
+
+function getSelectedAccountLabel() {
+  const accountId = getSelectedAccountId()
+  const account = accountsState.rows.find((item) => item.id === accountId)
+  return account?.label || accountId || 'selected account'
+}
+
+function getSelectedAccount() {
+  const accountId = getSelectedAccountId()
+  return accountsState.rows.find((item) => item.id === accountId) || null
+}
+
+function clearAccountQrView() {
+  if (!els.accountQrPanel || !els.accountQrStatus || !els.accountQrImage) return
+  els.accountQrPanel.classList.add('hidden')
+  els.accountQrStatus.textContent = ''
+  els.accountQrImage.removeAttribute('src')
+  els.accountQrImage.alt = ''
+  els.accountQrImage.classList.add('hidden')
+  els.accountQrImage.closest('.qrFrame')?.classList.remove('loading')
+}
+
+function forgetAccountQr(accountId) {
+  const qr = pendingQrCodes.get(accountId)
+  if (qr) {
+    renderedQrImages.delete(qr)
+  }
+  pendingQrCodes.delete(accountId)
+}
+
+function showQrPreparing(accountLabel) {
+  if (!els.accountQrPanel || !els.accountQrStatus || !els.accountQrImage) return
+  els.accountQrStatus.textContent = `Preparing QR code for ${accountLabel}. It will appear here as soon as WhatsApp sends it.`
+  els.accountQrPanel.classList.remove('hidden')
+  setQrVisualMode('loading')
+}
+
+async function renderAccountQrForSelectedAccount(options = {}) {
+  if (!els.accountQrPanel || !els.accountQrStatus || !els.accountQrImage) return
+  const accountId = getSelectedAccountId()
+  if (!accountId) {
+    clearAccountQrView()
+    return
+  }
+
+  const accountLabel = getSelectedAccountLabel()
+  const qr = pendingQrCodes.get(accountId)
+  if (!qr) {
+    clearAccountQrView()
+    return
+  }
+
+  els.accountQrStatus.textContent = `Preparing QR code for ${accountLabel}...`
+  els.accountQrPanel.classList.remove('hidden')
+  setQrVisualMode('loading')
+
+  try {
+    const rendered = await renderQrGraphic(qr, accountLabel)
+    if (rendered) {
+      els.accountQrStatus.textContent = `QR code ready. Scan it to connect ${accountLabel} on your phone.`
+      if (options.notifyReady) {
+        showToast(`QR code ready for ${accountLabel}.`, 'success')
+      }
+      return
+    }
+  } catch (error) {
+    console.error('Failed to render QR code', error)
+  }
+
+  showQrRenderError(accountLabel)
+}
+
+async function requestQrForSelectedAccount(options = {}) {
+  const accountId = getSelectedAccountId()
+  const accountLabel = getSelectedAccountLabel()
+  if (!accountId) {
+    setActionMessage('Please choose an account first.', 'warning')
+    return
+  }
+
+  clearQrRequestTimer()
+  qrRequestState.accountId = accountId
+  qrRequestState.deadline = options.deadline || Date.now() + QR_REQUEST_TIMEOUT_MS
+  qrRequestState.inFlight = true
+  syncQrRequestButton()
+  showQrPreparing(accountLabel)
+
+  try {
+    const data = await api(`/api/accounts/${encodeURIComponent(accountId)}/qr-code`, { method: 'POST' })
+    if (getSelectedAccountId() !== accountId || qrRequestState.accountId !== accountId) return
+
+    if (data?.status === 'connected') {
+      forgetAccountQr(accountId)
+      resetQrRequestState()
+      clearAccountQrView()
+      showToast(`${accountLabel} is already connected.`, 'success')
+      await loadAccounts()
+      return
+    }
+
+    if (typeof data?.qr === 'string' && data.qr) {
+      const previousQr = pendingQrCodes.get(accountId)
+      if (previousQr && previousQr !== data.qr) {
+        renderedQrImages.delete(previousQr)
+      }
+      pendingQrCodes.set(accountId, data.qr)
+      qrRequestState.inFlight = false
+      clearQrRequestTimer()
+      syncQrRequestButton()
+      await renderAccountQrForSelectedAccount({ notifyReady: options.notifyReady })
+      resetQrRequestState()
+      return
+    }
+
+    qrRequestState.inFlight = false
+    if (Date.now() < qrRequestState.deadline) {
+      syncQrRequestButton()
+      qrRequestState.timer = window.setTimeout(() => {
+        qrRequestState.timer = null
+        void requestQrForSelectedAccount({ notifyReady: true, deadline: qrRequestState.deadline })
+      }, QR_REQUEST_POLL_MS)
+      syncQrRequestButton()
+      return
+    }
+
+    resetQrRequestState()
+    els.accountQrStatus.textContent = `QR code for ${accountLabel} is still preparing. Try Request QR again in a moment.`
+    setQrVisualMode('loading')
+    showToast('QR is still preparing. Try again in a moment.', 'warning')
+  } catch (error) {
+    console.error(error)
+    if (isAuthError(error)) return
+    resetQrRequestState()
+    showQrRenderError(accountLabel)
+  } finally {
+    qrRequestState.inFlight = false
+    syncQrRequestButton()
+  }
+}
+
+function handleWaQrEvent(event) {
+  if (typeof event?.accountId !== 'string' || typeof event.qr !== 'string') return
+  if (qrRequestState.accountId !== event.accountId) return
+  const previousQr = pendingQrCodes.get(event.accountId)
+  if (previousQr && previousQr !== event.qr) {
+    renderedQrImages.delete(previousQr)
+  }
+  pendingQrCodes.set(event.accountId, event.qr)
+  if (getSelectedAccountId() === event.accountId) {
+    void renderAccountQrForSelectedAccount({ notifyReady: true }).finally(() => resetQrRequestState())
+  }
+}
+
+function handleWaQrAvailableEvent(event) {
+  if (typeof event?.accountId !== 'string') return
+  if (qrRequestState.accountId === event.accountId && getSelectedAccountId() === event.accountId) {
+    void requestQrForSelectedAccount({ notifyReady: true, deadline: qrRequestState.deadline || Date.now() + QR_REQUEST_TIMEOUT_MS })
+  }
+}
+
+function handleWaConnectionEvent(event) {
+  if (typeof event?.accountId !== 'string') return
+  if (event.status === 'connected') {
+    forgetAccountQr(event.accountId)
+    if (qrRequestState.accountId === event.accountId) {
+      resetQrRequestState()
+    }
+    if (getSelectedAccountId() === event.accountId) {
+      clearAccountQrView()
+    }
+    showToast(`WhatsApp connected for ${event.accountId}.`, 'success')
+  } else if (event.status === 'disconnected') {
+    showToast(`WhatsApp disconnected for ${event.accountId}.`, 'warning')
+  }
+}
+
+function setQrVisualMode(mode) {
+  els.accountQrImage?.classList.toggle('hidden', mode !== 'image')
+  const frame = els.accountQrImage?.closest('.qrFrame')
+  frame?.classList.remove('hidden')
+  frame?.classList.toggle('loading', mode === 'loading')
+}
+
+async function renderQrGraphic(qr, accountLabel) {
+  let dataUrl = renderedQrImages.get(qr)
+  if (!dataUrl) {
+    const data = await api('/api/qr-code', {
+      method: 'POST',
+      body: JSON.stringify({ text: qr }),
+    })
+    if (!data?.svg || typeof data.svg !== 'string') return false
+    dataUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(data.svg)}`
+    renderedQrImages.set(qr, dataUrl)
+  }
+
+  await loadQrImage(dataUrl, accountLabel)
+  setQrVisualMode('image')
+  return true
+}
+
+function loadQrImage(dataUrl, accountLabel) {
+  return new Promise((resolve, reject) => {
+    if (!(els.accountQrImage instanceof window.HTMLImageElement)) {
+      reject(new Error('qr_image_missing'))
+      return
+    }
+    els.accountQrImage.onload = () => {
+      els.accountQrImage.onload = null
+      els.accountQrImage.onerror = null
+      els.accountQrImage.alt = `QR code for ${accountLabel}`
+      resolve()
+    }
+    els.accountQrImage.onerror = () => {
+      els.accountQrImage.onload = null
+      els.accountQrImage.onerror = null
+      reject(new Error('qr_image_failed'))
+    }
+    els.accountQrImage.src = dataUrl
+  })
+}
+
+function showQrRenderError(accountLabel) {
+  els.accountQrStatus.textContent = `QR image for ${accountLabel} is not ready. Refresh the dashboard to try again.`
+  els.accountQrImage.removeAttribute('src')
+  els.accountQrImage.alt = ''
+  els.accountQrImage?.classList.add('hidden')
+  const frame = els.accountQrImage?.closest('.qrFrame')
+  frame?.classList.remove('loading')
+  frame?.classList.add('hidden')
+  showToast('QR image could not be rendered. Refresh the dashboard to request a new code.', 'error')
+}
+
+function sanitizeAuthPayload(payload) {
+  if (!payload || typeof payload !== 'object') return null
+  if (payload.user && typeof payload.user.email === 'string') return payload
+  return null
+}
+
+async function api(path, options = {}, cfg = { authAware: true }) {
+  const method = options.method ?? 'GET'
+  const fetchOptions = {
+    ...options,
+    headers: {
+      ...options.headers,
+    },
+  }
+
+  if (method !== 'GET' && options.body && !fetchOptions.headers['content-type']) {
     fetchOptions.headers['content-type'] = 'application/json'
   }
 
@@ -99,31 +587,76 @@ async function api(path, options = {}) {
   }
 
   if (!res.ok) {
-    throw new Error(payload?.error || `${res.status} ${res.statusText}`)
+    const errorCode = payload?.error || `${res.status} ${res.statusText}`
+    if (cfg.authAware !== false && errorCode === 'unauthorized') {
+      handleAuthExpiration()
+    }
+    throw new Error(errorCode)
   }
+
   return payload
 }
 
-async function loadAll() {
-  await Promise.all([
-    loadHealth(),
-    loadStats(),
-    loadChats(),
-    loadMessages(),
-    loadTransactions(),
-    loadAlertRules(),
-    loadAlerts(),
-  ])
+async function bootstrapAuth() {
+  if (stateAuth.loaded) return
+  try {
+    const session = await api('/api/auth/me', {}, { authAware: false })
+    const user = sanitizeAuthPayload(session)?.user
+    if (!user) throw new Error('Session lookup failed')
+
+    stateAuth.user = user
+    setLoggedUser(user)
+    showDashboard()
+    await startDashboard()
+  } catch (error) {
+    if (isAuthError(error)) {
+      showAuthForm('Please sign in to continue.')
+      return
+    }
+    throw error
+  } finally {
+    stateAuth.loaded = true
+  }
+}
+
+async function startDashboard() {
+  if (stateAuth.appStarted) return
+  stateAuth.appStarted = true
+
+  clearActionMessage()
+  try {
+    await Promise.all([
+      loadHealth(),
+      loadAccounts(),
+      loadStats(),
+      loadChats(),
+      loadMessages(),
+      loadTransactions(),
+      loadAlertRules(),
+      loadAlerts(),
+    ])
+    setActiveView('messages')
+    startLiveUpdates()
+  } catch (error) {
+    if (!isAuthError(error)) {
+      console.error(error)
+      throw error
+    }
+  }
 }
 
 async function loadHealth() {
   try {
-    await api('/api/health')
-    els.health.textContent = 'Connected'
-    els.health.className = 'status ok'
+    await api('/api/health', {}, { authAware: false })
+    els.health.textContent = ''
+    els.health.className = 'status statusDot ok'
+    els.health.setAttribute('aria-label', 'Connected')
+    els.health.setAttribute('title', 'Connected')
   } catch {
-    els.health.textContent = 'Offline'
-    els.health.className = 'status bad'
+    els.health.textContent = ''
+    els.health.className = 'status statusDot bad'
+    els.health.setAttribute('aria-label', 'Offline')
+    els.health.setAttribute('title', 'Offline')
   }
 }
 
@@ -153,7 +686,7 @@ async function loadChats() {
 
   const all = document.createElement('button')
   all.className = `chatItem ${state.messages.chat ? '' : 'active'}`
-  all.innerHTML = `<span class="chatName">All chats</span><span class="count">â€¢</span><span class="jid">archive</span>`
+  all.innerHTML = `<span class="chatName">All chats</span><span class="count">•</span><span class="jid">archive</span>`
   all.addEventListener('click', () => {
     state.messages.chat = ''
     state.messages.offset = 0
@@ -168,7 +701,7 @@ async function loadChats() {
     button.innerHTML = `
       <span class="chatName">${escapeHtml(chat.subject || chat.wa_jid)}</span>
       <span class="count">${formatNumber(chat.message_count)}</span>
-      <span class="jid">${escapeHtml(chat.type)} Â· ${escapeHtml(chat.wa_jid)}</span>
+      <span class="jid">${escapeHtml(chat.type)} · ${escapeHtml(chat.wa_jid)}</span>
     `
     button.addEventListener('click', () => {
       state.messages.chat = chat.wa_jid
@@ -269,9 +802,11 @@ async function loadTransactions() {
           })
           await loadTransactions()
           await loadStats()
+          showToast(`Transaction status updated to ${nextStatus}.`, 'success')
         } catch (error) {
           console.error(error)
-          alert(`Failed to update status: ${error.message}`)
+          showToast(`Failed to update status: ${getErrorMessage(error)}`, 'error')
+          await loadTransactions()
         }
       })
 
@@ -287,9 +822,10 @@ async function loadTransactions() {
             body: JSON.stringify({ messageId: messageId.trim() }),
           })
           await loadTransactions()
+          showToast('Message linked to transaction.', 'success')
         } catch (error) {
           console.error(error)
-          alert(`Failed to link message: ${error.message}`)
+          showToast(`Failed to link message: ${getErrorMessage(error)}`, 'error')
         }
       })
       row.querySelector('[data-action="addPayment"]')?.addEventListener('click', async (event) => {
@@ -316,9 +852,10 @@ async function loadTransactions() {
             }),
           })
           await loadTransactions()
+          showToast('Payment added to transaction.', 'success')
         } catch (error) {
           console.error(error)
-          alert(`Failed to add payment: ${error.message}`)
+          showToast(`Failed to add payment: ${getErrorMessage(error)}`, 'error')
         }
       })
 
@@ -405,9 +942,10 @@ async function loadAlerts() {
         try {
           await api(`/api/alerts/${encodeURIComponent(alertId)}/ack`, { method: 'POST' })
           await Promise.all([loadAlerts(), loadAlertRules(), loadStats()])
+          showToast('Alert acknowledged.', 'success')
         } catch (error) {
           console.error(error)
-          alert(`Failed to acknowledge alert: ${error.message}`)
+          showToast(`Failed to acknowledge alert: ${getErrorMessage(error)}`, 'error')
         }
       })
     }
@@ -434,6 +972,397 @@ function safeStringify(value) {
     return JSON.stringify(value)
   } catch {
     return String(value)
+  }
+}
+
+function formatNumber(value) {
+  return new Intl.NumberFormat().format(Number(value || 0))
+}
+
+function formatDate(value) {
+  if (!value) return 'No timestamp'
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(new Date(value))
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#039;')
+}
+
+function renderMedia(msg) {
+  const media = Array.isArray(msg.media) ? msg.media : []
+  if (media.length === 0) return '<span class="muted">—</span>'
+
+  return media
+    .map((m) => {
+      const isImage = m.type === 'image' || m.type === 'sticker'
+      if (m.storage_status === 'stored' && isImage) {
+        const src = `/api/media/${encodeURIComponent(m.id)}`
+        return `<a href="${src}" target="_blank" rel="noopener"><img class="thumb" src="${src}" alt="${escapeHtml(m.type)}" loading="lazy" /></a>`
+      }
+      const suffix = m.storage_status === 'pending' ? '…' : m.storage_status === 'failed' ? ' ⚠' : ''
+      return `<span class="mediaBadge ${escapeHtml(m.storage_status)}">${escapeHtml(m.type)}${suffix}</span>`
+    })
+    .join('')
+}
+
+function setActiveView(view) {
+  state.view = view
+  const isMessages = view === 'messages'
+  const isTransactions = view === 'transactions'
+  const isAlerts = view === 'alerts'
+
+  els.messagesTab.classList.toggle('active', isMessages)
+  els.transactionsTab.classList.toggle('active', isTransactions)
+  if (els.alertsTab) {
+    els.alertsTab.classList.toggle('active', isAlerts)
+  }
+  els.messagesTab.setAttribute('aria-selected', isMessages ? 'true' : 'false')
+  els.transactionsTab.setAttribute('aria-selected', isTransactions ? 'true' : 'false')
+  if (els.alertsTab) {
+    els.alertsTab.setAttribute('aria-selected', isAlerts ? 'true' : 'false')
+  }
+
+  els.messagesPane.classList.toggle('hidden', !isMessages)
+  els.transactionsPane.classList.toggle('hidden', !isTransactions)
+  if (els.alertsPane) {
+    els.alertsPane.classList.toggle('hidden', !isAlerts)
+  }
+  els.messagesPane.setAttribute('aria-hidden', String(!isMessages))
+  els.transactionsPane.setAttribute('aria-hidden', String(!isTransactions))
+  if (els.alertsPane) {
+    els.alertsPane.setAttribute('aria-hidden', String(!isAlerts))
+  }
+
+  if (isTransactions) {
+    loadTransactions()
+  } else if (isMessages) {
+    loadMessages()
+  } else {
+    loadAlertRules().catch(() => {})
+    loadAlerts()
+  }
+}
+
+async function loadAccounts() {
+  const data = await api('/api/accounts')
+  accountsState.rows = Array.isArray(data?.rows) ? data.rows : []
+  renderAccountList()
+  syncQrRequestButton()
+}
+
+function renderAccountList() {
+  if (!els.accountSelect || !els.accountList) return
+  const rows = accountsState.rows
+  const selectedAccountId = els.accountSelect.value
+  els.accountList.innerHTML = ''
+  els.accountSelect.innerHTML = '<option value="">Choose account</option>'
+
+  if (rows.length === 0) {
+    els.accountList.innerHTML = '<li class="muted">No accounts available.</li>'
+    return
+  }
+
+  for (const account of rows) {
+    const option = document.createElement('option')
+    option.value = account.id
+    option.textContent = `${account.label || account.id} (${account.phoneNumber || 'No WhatsApp number'})`
+    if (account.id === selectedAccountId) {
+      option.selected = true
+    }
+    els.accountSelect.appendChild(option)
+
+    const row = document.createElement('li')
+    row.innerHTML = `
+      <span>${escapeHtml(account.label || account.id)}</span>
+      <span class="muted">${escapeHtml(account.phoneNumber || 'not set')}</span>
+    `
+    els.accountList.appendChild(row)
+  }
+
+  if (!selectedAccountId && rows.length > 0 && els.accountPhoneInput) {
+    const fallbackId = rows[0].id
+    const fallback = rows[0]
+    if (fallbackId) {
+      els.accountSelect.value = fallbackId
+      els.accountPhoneInput.value = fallback.phoneNumber || ''
+    }
+  }
+
+}
+
+async function setAccountPhoneNumber(event) {
+  event.preventDefault()
+  clearActionMessage()
+
+  if (!els.accountSelect || !els.accountPhoneInput) return
+  const accountId = els.accountSelect.value
+  const rawNumber = els.accountPhoneInput.value.trim()
+  if (!accountId) {
+    setActionMessage('Please choose an account first.', 'warning')
+    return
+  }
+  if (!rawNumber) {
+    setActionMessage('Please enter a WhatsApp number.', 'warning')
+    return
+  }
+
+  try {
+    const updated = await api(`/api/accounts/${encodeURIComponent(accountId)}/whatsapp-number`, {
+      method: 'POST',
+      body: JSON.stringify({ phoneNumber: rawNumber }),
+    })
+    const row = (Array.isArray(accountsState.rows) ? accountsState.rows : []).find((candidate) => candidate.id === updated?.id)
+    if (row) {
+      row.phoneNumber = updated.phoneNumber
+    }
+    renderAccountList()
+    clearAccountQrView()
+    syncQrRequestButton()
+    setActionMessage('WhatsApp number saved. Request QR when you are ready to scan.', 'success')
+  } catch (error) {
+    if (error instanceof Error && error.message === 'forbidden') {
+      setActionMessage('Only admins can register WhatsApp numbers.', 'warning')
+      return
+    }
+    if (isAuthError(error)) return
+    setActionMessage(`Failed to save WhatsApp number: ${getErrorMessage(error)}`, 'error')
+  }
+}
+
+function autofillSelectedAccount() {
+  if (!els.accountSelect || !els.accountPhoneInput) return
+  const accountId = els.accountSelect.value
+  const account = accountsState.rows.find((item) => item.id === accountId)
+  els.accountPhoneInput.value = account?.phoneNumber || ''
+  clearActionMessage()
+  resetQrRequestState()
+  clearAccountQrView()
+  syncQrRequestButton()
+}
+
+async function login(event) {
+  event.preventDefault()
+  if (!els.loginEmail || !els.loginPassword || !els.loginSubmit) return
+
+  const email = els.loginEmail.value.trim().toLowerCase()
+  const password = els.loginPassword.value
+  if (!email || !password) {
+    if (els.authError) {
+      els.authError.textContent = 'Email and password are required.'
+    }
+    return
+  }
+
+  els.loginSubmit.disabled = true
+  if (els.authError) {
+    els.authError.textContent = 'Signing in...'
+  }
+
+  try {
+    const data = await api(
+      '/api/auth/login',
+      {
+        method: 'POST',
+        body: JSON.stringify({ email, password }),
+      },
+      { authAware: false },
+    )
+
+    const user = sanitizeAuthPayload(data)?.user
+    if (!user) throw new Error('Invalid auth response')
+
+    stateAuth.user = user
+    stateAuth.loaded = true
+    setLoggedUser(user)
+    showDashboard()
+    clearActionMessage()
+    await startDashboard()
+    showToast(`Signed in as ${user.name || user.email}.`, 'success')
+  } catch (error) {
+    if (els.authError) {
+      if (error instanceof Error) {
+        els.authError.textContent = error.message === 'unauthorized' ? 'Invalid email or password.' : error.message
+      } else {
+        els.authError.textContent = 'Unable to sign in.'
+      }
+    }
+    showToast(els.authError?.textContent || 'Unable to sign in.', 'error')
+  } finally {
+    els.loginSubmit.disabled = false
+  }
+}
+
+async function register(event) {
+  event.preventDefault()
+  if (
+    !els.registerName ||
+    !els.registerEmail ||
+    !els.registerPassword ||
+    !els.registerPasswordConfirm ||
+    !els.registerSubmit
+  ) {
+    return
+  }
+
+  const name = els.registerName.value.trim()
+  const email = els.registerEmail.value.trim().toLowerCase()
+  const password = els.registerPassword.value
+  const passwordConfirm = els.registerPasswordConfirm.value
+
+  if (!name || !email || !password || !passwordConfirm) {
+    if (els.authError) {
+      els.authError.textContent = 'Name, email, and password are required.'
+    }
+    return
+  }
+
+  if (password.length < 12) {
+    if (els.authError) {
+      els.authError.textContent = 'Password must be at least 12 characters.'
+    }
+    return
+  }
+
+  if (password !== passwordConfirm) {
+    if (els.authError) {
+      els.authError.textContent = 'Passwords do not match.'
+    }
+    return
+  }
+
+  els.registerSubmit.disabled = true
+  if (els.authError) {
+    els.authError.textContent = 'Creating account...'
+  }
+
+  try {
+    const data = await api(
+      '/api/auth/register',
+      {
+        method: 'POST',
+        body: JSON.stringify({ name, email, password }),
+      },
+      { authAware: false },
+    )
+    const user = sanitizeAuthPayload(data)?.user
+    if (!user) throw new Error('Invalid auth response')
+
+    stateAuth.user = user
+    stateAuth.loaded = true
+    setLoggedUser(user)
+    showDashboard()
+    if (els.registerForm) {
+      els.registerForm.reset?.()
+    }
+    clearActionMessage()
+    await startDashboard()
+    showToast('Account created and signed in.', 'success')
+  } catch (error) {
+    if (error instanceof Error && error.message === 'forbidden') {
+      if (els.authError) {
+        els.authError.textContent = 'Registration is locked. Ask an admin to create an account.'
+      }
+      showToast('Registration is locked. Ask an admin to create an account.', 'warning')
+      return
+    }
+    if (els.authError) {
+      if (error instanceof Error) {
+        els.authError.textContent = error.message
+      } else {
+        els.authError.textContent = 'Unable to register.'
+      }
+    }
+    showToast(els.authError?.textContent || 'Unable to register.', 'error')
+  } finally {
+    els.registerSubmit.disabled = false
+  }
+}
+
+function switchToRegister(event) {
+  event.preventDefault()
+  setAuthMode('register')
+}
+
+function switchToLogin(event) {
+  event.preventDefault()
+  setAuthMode('login')
+}
+
+async function logout() {
+  try {
+    await api('/api/auth/logout', { method: 'POST' }, { authAware: false })
+  } catch {
+    // ignore logout errors; user is asked to login again below
+  } finally {
+    stateAuth.user = null
+    stateAuth.loaded = true
+    handleAuthExpiration('Signed out.')
+    showToast('Signed out.', 'success')
+  }
+}
+
+function stopLiveUpdates() {
+  if (stateAuth.eventSource) {
+    stateAuth.eventSource.close()
+    stateAuth.eventSource = null
+  }
+}
+
+// Live updates: the API streams worker events over SSE. Coalesce bursts into one refresh.
+let refreshTimer = null
+function scheduleRefresh() {
+  if (refreshTimer) return
+  refreshTimer = setTimeout(() => {
+    refreshTimer = null
+    loadStats().catch(() => {})
+    loadChats().catch(() => {})
+    if (state.view === 'messages' && state.messages.offset === 0 && !state.messages.q) {
+      loadMessages().catch(() => {})
+    }
+    if (state.view === 'transactions') {
+      loadTransactions().catch(() => {})
+    }
+    if (state.view === 'alerts') {
+      loadAlerts().catch(() => {})
+    }
+  }, 500)
+}
+
+function startLiveUpdates() {
+  stopLiveUpdates()
+  const es = new EventSource('/api/stream')
+  stateAuth.eventSource = es
+  es.onmessage = (event) => {
+    let parsed
+    try {
+      parsed = JSON.parse(event.data)
+    } catch {
+      return
+    }
+    if (parsed.type === 'qr') {
+      handleWaQrEvent(parsed)
+      return
+    }
+    if (parsed.type === 'qr_available') {
+      handleWaQrAvailableEvent(parsed)
+      return
+    }
+    if (parsed.type === 'connection') {
+      handleWaConnectionEvent(parsed)
+      return
+    }
+    if (parsed.type === 'message' || parsed.type === 'media' || parsed.type === 'alert') {
+      queueLiveEventToast(parsed.type)
+      scheduleRefresh()
+    }
   }
 }
 
@@ -479,7 +1408,7 @@ els.transactionCreateForm.addEventListener('submit', async (event) => {
   const direction = els.transactionDirection.value
 
   if (!fromContactWaJid || !toContactWaJid || !amount) {
-    alert('From JID, To JID and Amount are required.')
+    showToast('From JID, To JID and Amount are required.', 'warning')
     return
   }
 
@@ -502,9 +1431,10 @@ els.transactionCreateForm.addEventListener('submit', async (event) => {
     state.transactions.offset = 0
     await loadTransactions()
     await loadStats()
+    showToast('Transaction created.', 'success')
   } catch (error) {
     console.error(error)
-    alert(`Failed to create transaction: ${error.message}`)
+    showToast(`Failed to create transaction: ${getErrorMessage(error)}`, 'error')
   }
 })
 
@@ -515,7 +1445,7 @@ els.alertFilterForm?.addEventListener('submit', (event) => {
   state.alerts.offset = 0
   loadAlerts().catch((error) => {
     console.error(error)
-    alert(`Failed to load alerts: ${error.message}`)
+    showToast(`Failed to load alerts: ${getErrorMessage(error)}`, 'error')
   })
 })
 
@@ -527,7 +1457,7 @@ els.alertsClearButton?.addEventListener('click', () => {
   if (els.alertsRuleKindFilter) els.alertsRuleKindFilter.value = ''
   loadAlerts().catch((error) => {
     console.error(error)
-    alert(`Failed to load alerts: ${error.message}`)
+    showToast(`Failed to load alerts: ${getErrorMessage(error)}`, 'error')
   })
 })
 
@@ -539,7 +1469,7 @@ els.createAlertRuleForm?.addEventListener('submit', async (event) => {
   const keyword = (els.alertRuleKeyword?.value ?? '').trim()
 
   if (kind === 'keyword' && !keyword) {
-    alert('Keyword is required for keyword rules.')
+    showToast('Keyword is required for keyword rules.', 'warning')
     return
   }
 
@@ -558,13 +1488,19 @@ els.createAlertRuleForm?.addEventListener('submit', async (event) => {
     state.alerts.offset = 0
     state.alerts.ruleKind = kind
     await Promise.all([loadAlertRules(), loadAlerts(), loadStats()])
+    showToast('Alert rule created.', 'success')
   } catch (error) {
     console.error(error)
-    alert(`Failed to create alert rule: ${error.message}`)
+    showToast(`Failed to create alert rule: ${getErrorMessage(error)}`, 'error')
   }
 })
 
-els.refreshButton.addEventListener('click', loadAll)
+els.refreshButton.addEventListener('click', async () => {
+  if (!stateAuth.user) return
+  await loadStats()
+  await Promise.all([loadChats(), loadMessages(), loadTransactions(), loadAlertRules(), loadAlerts(), loadAccounts()])
+  showToast('Dashboard refreshed.', 'success')
+})
 
 els.prevButton.addEventListener('click', () => {
   state.messages.offset = Math.max(0, state.messages.offset - state.messages.limit)
@@ -603,121 +1539,26 @@ els.alertsTab?.addEventListener('click', () => {
   setActiveView('alerts')
 })
 
-function setActiveView(view) {
-  state.view = view
-  const isMessages = view === 'messages'
-  const isTransactions = view === 'transactions'
-  const isAlerts = view === 'alerts'
-
-  els.messagesTab.classList.toggle('active', isMessages)
-  els.transactionsTab.classList.toggle('active', isTransactions)
-  if (els.alertsTab) {
-    els.alertsTab.classList.toggle('active', isAlerts)
-  }
-  els.messagesTab.setAttribute('aria-selected', isMessages ? 'true' : 'false')
-  els.transactionsTab.setAttribute('aria-selected', isTransactions ? 'true' : 'false')
-  if (els.alertsTab) {
-    els.alertsTab.setAttribute('aria-selected', isAlerts ? 'true' : 'false')
-  }
-
-  els.messagesPane.classList.toggle('hidden', !isMessages)
-  els.transactionsPane.classList.toggle('hidden', !isTransactions)
-  if (els.alertsPane) {
-    els.alertsPane.classList.toggle('hidden', !isAlerts)
-  }
-  els.messagesPane.setAttribute('aria-hidden', String(!isMessages))
-  els.transactionsPane.setAttribute('aria-hidden', String(!isTransactions))
-  if (els.alertsPane) {
-    els.alertsPane.setAttribute('aria-hidden', String(!isAlerts))
-  }
-
-  if (isTransactions) {
-    loadTransactions()
-  } else if (isMessages) {
-    loadMessages()
-  } else {
-    loadAlertRules().catch(() => {})
-    loadAlerts()
-  }
-}
-
-function renderMedia(msg) {
-  const media = Array.isArray(msg.media) ? msg.media : []
-  if (media.length === 0) return '<span class="muted">â€”</span>'
-
-  return media
-    .map((m) => {
-      const isImage = m.type === 'image' || m.type === 'sticker'
-      if (m.storage_status === 'stored' && isImage) {
-        const src = `/api/media/${encodeURIComponent(m.id)}`
-        return `<a href="${src}" target="_blank" rel="noopener"><img class="thumb" src="${src}" alt="${escapeHtml(m.type)}" loading="lazy" /></a>`
-      }
-      const suffix = m.storage_status === 'pending' ? 'â€¦' : m.storage_status === 'failed' ? ' âœ—' : ''
-      return `<span class="mediaBadge ${escapeHtml(m.storage_status)}">${escapeHtml(m.type)}${suffix}</span>`
-    })
-    .join('')
-}
-
-// Live updates: the API streams worker events over SSE. Coalesce bursts (a group
-// dumping 40 photos) into one refresh so we don't thrash the table.
-let refreshTimer = null
-function scheduleRefresh() {
-  if (refreshTimer) return
-  refreshTimer = setTimeout(() => {
-    refreshTimer = null
-    loadStats().catch(() => {})
-    loadChats().catch(() => {})
-    if (state.view === 'messages' && state.messages.offset === 0 && !state.messages.q) {
-      loadMessages().catch(() => {})
-    }
-    if (state.view === 'transactions') {
-      loadTransactions().catch(() => {})
-    }
-    if (state.view === 'alerts') {
-      loadAlerts().catch(() => {})
-    }
-  }, 500)
-}
-
-function startLiveUpdates() {
-  const es = new EventSource('/api/stream')
-  es.onmessage = (event) => {
-    let parsed
-    try {
-      parsed = JSON.parse(event.data)
-    } catch {
-      return
-    }
-    if (parsed.type === 'message' || parsed.type === 'media' || parsed.type === 'alert') scheduleRefresh()
-  }
-  // EventSource auto-reconnects on error; nothing to do here.
-}
-
-function formatNumber(value) {
-  return new Intl.NumberFormat().format(Number(value || 0))
-}
-
-function formatDate(value) {
-  if (!value) return 'No timestamp'
-  return new Intl.DateTimeFormat(undefined, {
-    dateStyle: 'medium',
-    timeStyle: 'short',
-  }).format(new Date(value))
-}
-
-function escapeHtml(value) {
-  return String(value ?? '')
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#039;')
-}
-
-loadAll().catch((error) => {
-  console.error(error)
-  els.health.textContent = 'Error'
-  els.health.className = 'status bad'
+els.loginForm?.addEventListener('submit', login)
+els.showRegisterButton?.addEventListener('click', switchToRegister)
+els.showLoginButton?.addEventListener('click', switchToLogin)
+els.registerForm?.addEventListener('submit', register)
+els.logoutButton?.addEventListener('click', logout)
+els.registerWhatsappForm?.addEventListener('submit', setAccountPhoneNumber)
+els.requestQrButton?.addEventListener('click', () => {
+  clearActionMessage()
+  void requestQrForSelectedAccount({ notifyReady: true })
 })
-setActiveView('messages')
-startLiveUpdates()
+els.accountSelect?.addEventListener('change', autofillSelectedAccount)
+
+async function start() {
+  showBootstrap()
+  setAuthMode('login')
+  try {
+    await bootstrapAuth()
+  } catch (error) {
+    showAuthForm(error instanceof Error ? error.message : 'Unable to initialize the dashboard.')
+  }
+}
+
+start()

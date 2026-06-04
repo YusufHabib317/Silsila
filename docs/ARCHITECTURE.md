@@ -321,11 +321,25 @@ refinement.
 |---|---|---|
 | id | uuid PK | |
 | email | varchar unique | |
-| password_hash | varchar | argon2 / bcrypt |
+| password_hash | varchar | scrypt + per-row random salt |
 | name | varchar | |
 | role | varchar | `admin` / `staff` |
 | is_active | boolean | |
 | created_at | timestamptz | |
+
+**`refresh_tokens`** — rotating server-tracked refresh sessions (DB-backed).
+
+| column | type | notes |
+|---|---|---|
+| id | uuid PK | JTI from the refresh JWT |
+| user_id | uuid | FK → users.id |
+| token_hash | text | SHA-256 hash of raw refresh token |
+| csrf_hash | text | SHA-256 hash of issued CSRF token |
+| expires_at | timestamptz | |
+| ip_address_hash | text | SHA-256 hash of last IP (best-effort) |
+| user_agent | text | |
+| revoked_at | timestamptz | NULL while active |
+| created_at / updated_at | timestamptz | |
 
 **`alert_rules`** — configurable triggers.
 
@@ -415,20 +429,18 @@ without losing the past.
 
 ## 8. Authentication
 
-**`@nestjs/passport` + Passport**, the idiomatic and battle-tested NestJS choice.
-For an internal dashboard with a few known users this stays small:
+For this repository version, authentication is hard-coded in the API with:
 
-- `passport-local` strategy for email + password login; passwords hashed with
-  **argon2** (or bcrypt).
-- `passport-jwt` strategy guarding every protected route.
-- The JWT is issued into an **`httpOnly`, `Secure`, `SameSite` cookie**, never
-  localStorage, so scripts cannot leak it.
-- Auth lives on the **NestJS API**, because that is the process actually guarding
-  the data.
+- Email/password login on `/api/auth/login`.
+- JWT access tokens in an `HttpOnly`, `Secure`, `SameSite=Strict` cookie (short-lived).
+- Database-backed rotating refresh tokens (`refresh_tokens` table): hash-only storage,
+  expiry, revoke-on-rotation, and CSRF-bound refresh endpoint.
+- Role checks on every protected API route for `admin` / `staff`.
+- Refresh flow uses `X-CSRF-Token` header with the non-`HttpOnly` CSRF cookie value.
+- Audit events for mutating actions in `audit_log`.
 
-Alternatives ruled out: Lucia (sunset by its author), Auth.js/NextAuth (lives on
-the Next side, awkward when the Nest API guards the data), Clerk/Auth0 (paid hosted
-SaaS — overkill, extra dependency, and possible access/payment friction from Syria).
+Alternatives still considered for future refactors: `@nestjs/passport`,
+Auth.js/NextAuth, or hosted IdPs (not used in phase 5).
 
 ---
 
@@ -442,7 +454,7 @@ SaaS — overkill, extra dependency, and possible access/payment friction from S
 | Database | Neon Postgres | Managed PG; budget for near-24/7 compute (ingestion rarely idles) |
 | Queue | BullMQ on Redis | Receive-fast, retries, burst absorption once raw persistence/media begins |
 | Media storage | Cloudflare R2 | S3-compatible, cheap, **zero egress fees** (dashboard reloads media constantly) |
-| Auth | @nestjs/passport + JWT cookie | Ready, on the API, no hosted dependency |
+| Auth | JWT access + rotating refresh tokens + role checks | Minimal dependencies, audit-ready |
 | Frontend | Next.js + Mantine | Mantine `DirectionProvider` = `rtl` for Arabic |
 | Tables UI | `mantine-react-table` | Sortable/filterable message & transaction tables |
 | Data fetching | TanStack Query | |
@@ -567,9 +579,19 @@ Move search to Meilisearch (better Arabic + typos). Statistics dashboards. The
 `alert_rules` engine: keyword alerts (e.g. "مرتجع"), stale-pending reminders,
 no-movement nudges, feeding `notifications`.
 
-### Phase 5 — Harden
-Finalize `users` / roles / permissions, `audit_log`, automated Postgres backups,
-security review. Optionally begin per-relationship role modeling.
+### Phase 5 — Harden (completed)
+Completed with:
+
+- `users` + `audit_log` migration and API exposure.
+- Role-based access for dashboard writes and read paths.
+- JWT-based session auth (access/refresh cookies), login-rate limiting, and CSRF-protected
+  refresh.
+- Backup automation for `DATABASE_URL` via `scripts/backup-postgres.ps1` and
+  `pnpm backup:postgres`.
+
+Remaining optional stretch:
+
+- Per-relationship role modeling.
 
 ---
 

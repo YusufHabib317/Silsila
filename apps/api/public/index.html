@@ -3,256 +3,344 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Silsila Archive</title>
+    <title>Silsila Dashboard</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <main class="shell">
-      <header class="topbar">
-        <div>
+      <section id="authShell" class="authShell hidden">
+        <article class="card authCard">
           <p class="eyebrow">Silsila</p>
           <h1>WhatsApp Archive</h1>
-        </div>
-        <div class="status" id="health">Checking</div>
-      </header>
+          <p>Sign in with your email and password to continue.</p>
 
-      <section class="metrics" aria-label="Archive totals">
-        <div><span id="messagesCount">0</span><small>Messages</small></div>
-        <div><span id="chatsCount">0</span><small>Chats</small></div>
-        <div><span id="contactsCount">0</span><small>Contacts</small></div>
-        <div><span id="mediaCount">0</span><small>Media rows</small></div>
-        <div><span id="transactionsCount">0</span><small>Transactions</small></div>
-        <div><span id="pendingTransactionsCount">0</span><small>Pending transactions</small></div>
-        <div><span id="unreadAlertsCount">0</span><small>Unread alerts</small></div>
-        <div><span id="criticalAlertsCount">0</span><small>Critical alerts</small></div>
+          <form id="loginForm" class="authForm">
+            <label>
+              Email
+              <input id="loginEmail" type="email" autocomplete="email" required />
+            </label>
+            <label>
+              Password
+              <input id="loginPassword" type="password" autocomplete="current-password" required />
+            </label>
+            <button id="loginSubmit" type="submit">Sign in</button>
+          </form>
+
+          <button id="showRegisterButton" type="button" class="ghostButton" style="margin-bottom: 10px;">Need an account? Register</button>
+
+          <form id="registerForm" class="authForm hidden">
+            <p>Register your first admin user.</p>
+            <label>
+              Name
+              <input id="registerName" type="text" autocomplete="name" required />
+            </label>
+            <label>
+              Email
+              <input id="registerEmail" type="email" autocomplete="email" required />
+            </label>
+            <label>
+              Password
+              <input id="registerPassword" type="password" autocomplete="new-password" required />
+            </label>
+            <label>
+              Confirm Password
+              <input id="registerPasswordConfirm" type="password" autocomplete="new-password" required />
+            </label>
+            <button id="registerSubmit" type="submit">Create account</button>
+            <button id="showLoginButton" type="button" class="ghostButton">Back to sign in</button>
+          </form>
+
+          <p id="authError" class="muted" role="alert"></p>
+        </article>
       </section>
 
-      <section class="workspace">
-        <aside class="rail">
-          <div class="railHead">
-            <h2>Chats</h2>
-            <button class="iconButton" id="refreshButton" title="Refresh">↻</button>
+      <section id="bootShell" class="bootShell">
+        <article class="card authCard">
+          <p class="eyebrow">Silsila</p>
+          <h1>WhatsApp Archive</h1>
+          <p id="bootMessage" class="muted" role="status">Checking your session...</p>
+          <div class="bootSpinner" aria-hidden="true"></div>
+        </article>
+      </section>
+
+      <section id="appShell" class="appShell hidden">
+        <header class="topbar">
+          <div class="topbarTitle">
+            <p class="eyebrow">Silsila</p>
+            <h1>WhatsApp Archive</h1>
           </div>
-          <div id="chatList" class="chatList"></div>
-        </aside>
-
-        <section class="messagesPane">
-          <div class="panelTabs" role="tablist">
-            <button type="button" class="panelTab active" id="messagesTab" role="tab" aria-selected="true" aria-controls="messagesPane">Messages</button>
-            <button type="button" class="panelTab" id="transactionsTab" role="tab" aria-selected="false" aria-controls="transactionsPane">Transactions</button>
-            <button type="button" class="panelTab" id="alertsTab" role="tab" aria-selected="false" aria-controls="alertsPane">Alerts</button>
+          <div class="topbarActions">
+            <p id="loggedUser" class="loggedUser muted"></p>
+            <button id="logoutButton" class="ghostButton" type="button">Logout</button>
           </div>
+          <div class="status statusDot" id="health" role="status" aria-label="Checking connection" title="Checking connection"></div>
+        </header>
 
-          <section class="panel" id="messagesPane">
-            <form class="searchbar" id="searchForm">
-              <input id="searchInput" name="q" placeholder="Search text, sender, or JID" autocomplete="off" />
-              <button type="submit">Search</button>
-              <button type="button" id="clearButton">Clear</button>
-            </form>
+        <section class="whatsappCard card">
+          <h2>Register WhatsApp number</h2>
+          <form id="registerWhatsappForm" class="accountForm">
+            <label>
+              Account
+              <select id="accountSelect">
+                <option value="">Choose account</option>
+              </select>
+            </label>
+            <label>
+              WhatsApp number
+              <input id="accountPhoneInput" type="text" placeholder="+961 70 000 000" />
+            </label>
+            <button type="submit" class="primaryAction">Save number</button>
+            <button id="requestQrButton" type="button" class="secondaryAction">Request QR</button>
+          </form>
+          <p id="accountActionMessage" class="muted" role="status"></p>
+          <div id="accountQrPanel" class="qrPanel hidden">
+            <p id="accountQrStatus" class="muted" role="status"></p>
+            <div class="qrFrame">
+              <img id="accountQrImage" alt="WhatsApp QR code" />
+            </div>
+          </div>
+          <ul id="accountList"></ul>
+        </section>
 
-            <div class="tableWrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Time</th>
-                    <th>Chat</th>
-                    <th>Sender</th>
-                    <th>Type</th>
-                    <th>Message</th>
-                    <th>Media</th>
-                  </tr>
-                </thead>
-                <tbody id="messageRows"></tbody>
-              </table>
+        <section class="metrics" aria-label="Archive totals">
+          <div><span id="messagesCount">0</span><small>Messages</small></div>
+          <div><span id="chatsCount">0</span><small>Chats</small></div>
+          <div><span id="contactsCount">0</span><small>Contacts</small></div>
+          <div><span id="mediaCount">0</span><small>Media rows</small></div>
+          <div><span id="transactionsCount">0</span><small>Transactions</small></div>
+          <div><span id="pendingTransactionsCount">0</span><small>Pending transactions</small></div>
+          <div><span id="unreadAlertsCount">0</span><small>Unread alerts</small></div>
+          <div><span id="criticalAlertsCount">0</span><small>Critical alerts</small></div>
+        </section>
+
+        <section class="workspace">
+          <aside class="rail">
+            <div class="railHead">
+              <h2>Chats</h2>
+              <button class="iconButton" id="refreshButton" title="Refresh">↻</button>
+            </div>
+            <div id="chatList" class="chatList"></div>
+          </aside>
+
+          <section class="messagesPane">
+            <div class="panelTabs" role="tablist">
+              <button type="button" class="panelTab active" id="messagesTab" role="tab" aria-selected="true" aria-controls="messagesPane">Messages</button>
+              <button type="button" class="panelTab" id="transactionsTab" role="tab" aria-selected="false" aria-controls="transactionsPane">Transactions</button>
+              <button type="button" class="panelTab" id="alertsTab" role="tab" aria-selected="false" aria-controls="alertsPane">Alerts</button>
             </div>
 
-            <footer class="pager">
-              <button id="prevButton" type="button">Previous</button>
-              <span id="pageInfo">0 messages</span>
-              <button id="nextButton" type="button">Next</button>
-            </footer>
-          </section>
+            <section class="panel" id="messagesPane">
+              <form class="searchbar" id="searchForm">
+                <input id="searchInput" name="q" placeholder="Search text, sender, or JID" autocomplete="off" />
+                <button type="submit">Search</button>
+                <button type="button" id="clearButton">Clear</button>
+              </form>
 
-          <section class="panel hidden" id="transactionsPane" aria-hidden="true">
-            <form class="searchbar" id="transactionFilterForm">
-              <input id="transactionSearchInput" name="q" placeholder="Search product, notes, or contact JID" autocomplete="off" />
-              <select id="transactionStatusFilter" name="status">
-                <option value="">All statuses</option>
-                <option value="draft">draft</option>
-                <option value="pending">pending</option>
-                <option value="in_transit">in transit</option>
-                <option value="completed">completed</option>
-                <option value="refunded">refunded</option>
-                <option value="lost">lost</option>
-                <option value="cancelled">cancelled</option>
-              </select>
-              <button type="submit">Filter</button>
-              <button type="button" id="transactionClearButton">Clear</button>
-            </form>
+              <div class="tableWrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Time</th>
+                      <th>Chat</th>
+                      <th>Sender</th>
+                      <th>Type</th>
+                      <th>Message</th>
+                      <th>Media</th>
+                    </tr>
+                  </thead>
+                  <tbody id="messageRows"></tbody>
+                </table>
+              </div>
 
-            <form class="transactionForm" id="createTransactionForm">
-              <label>
-                From contact JID
-                <input id="transactionFrom" placeholder="from_contact_wa_jid" required />
-              </label>
-              <label>
-                To contact JID
-                <input id="transactionTo" placeholder="to_contact_wa_jid" required />
-              </label>
-              <label>
-                Direction
-                <select id="transactionDirection">
-                  <option value="incoming">incoming</option>
-                  <option value="outgoing">outgoing</option>
-                </select>
-              </label>
-              <label>
-                Product
-                <input id="transactionProduct" placeholder="Product description" />
-              </label>
-              <label>
-                Quantity
-                <input id="transactionQuantity" placeholder="12.00" />
-              </label>
-              <label>
-                Amount
-                <input id="transactionAmount" placeholder="0.00" required />
-              </label>
-              <label>
-                Currency
-                <input id="transactionCurrency" value="USD" placeholder="USD" maxlength="16" />
-              </label>
-              <label>
-                Initial status
-                <select id="transactionStatus">
+              <footer class="pager">
+                <button id="prevButton" type="button">Previous</button>
+                <span id="pageInfo">0 messages</span>
+                <button id="nextButton" type="button">Next</button>
+              </footer>
+            </section>
+
+            <section class="panel hidden" id="transactionsPane" aria-hidden="true">
+              <form class="searchbar" id="transactionFilterForm">
+                <input id="transactionSearchInput" name="q" placeholder="Search product, notes, or contact JID" autocomplete="off" />
+                <select id="transactionStatusFilter" name="status">
+                  <option value="">All statuses</option>
                   <option value="draft">draft</option>
                   <option value="pending">pending</option>
                   <option value="in_transit">in transit</option>
                   <option value="completed">completed</option>
+                  <option value="refunded">refunded</option>
+                  <option value="lost">lost</option>
+                  <option value="cancelled">cancelled</option>
                 </select>
-              </label>
-              <label>
-                Notes
-                <input id="transactionNotes" placeholder="Optional notes" />
-              </label>
-              <button type="submit" class="primaryAction">Create transaction</button>
-            </form>
+                <button type="submit">Filter</button>
+                <button type="button" id="transactionClearButton">Clear</button>
+              </form>
 
-            <div class="tableWrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Created</th>
-                    <th>From / To</th>
-                    <th>Direction</th>
-                    <th>Product</th>
-                    <th>Amount</th>
-                    <th>Status</th>
-                    <th>Messages</th>
-                    <th>Payments</th>
-                  </tr>
-                </thead>
-                <tbody id="transactionRows"></tbody>
-              </table>
-            </div>
+              <form class="transactionForm" id="createTransactionForm">
+                <label>
+                  From contact JID
+                  <input id="transactionFrom" placeholder="from_contact_wa_jid" required />
+                </label>
+                <label>
+                  To contact JID
+                  <input id="transactionTo" placeholder="to_contact_wa_jid" required />
+                </label>
+                <label>
+                  Direction
+                  <select id="transactionDirection">
+                    <option value="incoming">incoming</option>
+                    <option value="outgoing">outgoing</option>
+                  </select>
+                </label>
+                <label>
+                  Product
+                  <input id="transactionProduct" placeholder="Product description" />
+                </label>
+                <label>
+                  Quantity
+                  <input id="transactionQuantity" placeholder="12.00" />
+                </label>
+                <label>
+                  Amount
+                  <input id="transactionAmount" placeholder="0.00" required />
+                </label>
+                <label>
+                  Currency
+                  <input id="transactionCurrency" value="USD" placeholder="USD" maxlength="16" />
+                </label>
+                <label>
+                  Initial status
+                  <select id="transactionStatus">
+                    <option value="draft">draft</option>
+                    <option value="pending">pending</option>
+                    <option value="in_transit">in transit</option>
+                    <option value="completed">completed</option>
+                  </select>
+                </label>
+                <label>
+                  Notes
+                  <input id="transactionNotes" placeholder="Optional notes" />
+                </label>
+                <button type="submit" class="primaryAction">Create transaction</button>
+              </form>
 
-            <footer class="pager">
-              <button id="txPrevButton" type="button">Previous</button>
-              <span id="txPageInfo">0 transactions</span>
-              <button id="txNextButton" type="button">Next</button>
-            </footer>
-          </section>
+              <div class="tableWrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Created</th>
+                      <th>From / To</th>
+                      <th>Direction</th>
+                      <th>Product</th>
+                      <th>Amount</th>
+                      <th>Status</th>
+                      <th>Messages</th>
+                      <th>Payments</th>
+                    </tr>
+                  </thead>
+                  <tbody id="transactionRows"></tbody>
+                </table>
+              </div>
 
-          <section class="panel hidden" id="alertsPane" aria-hidden="true">
-            <form class="searchbar" id="alertFilterForm">
-              <label for="alertsUnreadOnly">
-                <input id="alertsUnreadOnly" type="checkbox" checked />
-                Unread only
-              </label>
-              <select id="alertsRuleKindFilter" name="kind">
-                <option value="">All rule kinds</option>
-                <option value="keyword">keyword</option>
-                <option value="stale_pending">stale_pending</option>
-                <option value="no_movement">no_movement</option>
-              </select>
-              <button type="submit">Filter</button>
-              <button type="button" id="alertsClearButton">Clear</button>
-            </form>
+              <footer class="pager">
+                <button id="txPrevButton" type="button">Previous</button>
+                <span id="txPageInfo">0 transactions</span>
+                <button id="txNextButton" type="button">Next</button>
+              </footer>
+            </section>
 
-            <form class="alertRuleForm" id="createAlertRuleForm">
-              <label>
-                Rule name
-                <input id="alertRuleName" required placeholder="e.g. High-value keyword" />
-              </label>
-              <label>
-                Kind
-                <select id="alertRuleKind" required>
+            <section class="panel hidden" id="alertsPane" aria-hidden="true">
+              <form class="searchbar" id="alertFilterForm">
+                <label for="alertsUnreadOnly">
+                  <input id="alertsUnreadOnly" type="checkbox" checked />
+                  Unread only
+                </label>
+                <select id="alertsRuleKindFilter" name="kind">
+                  <option value="">All rule kinds</option>
                   <option value="keyword">keyword</option>
                   <option value="stale_pending">stale_pending</option>
                   <option value="no_movement">no_movement</option>
                 </select>
-              </label>
-              <label>
-                Threshold minutes
-                <input id="alertRuleThreshold" type="number" min="1" placeholder="60" />
-              </label>
-              <label>
-                Cooldown minutes
-                <input id="alertRuleCooldown" type="number" min="1" placeholder="30" />
-              </label>
-              <label>
-                Keyword
-                <input id="alertRuleKeyword" placeholder="Required for keyword rules" />
-              </label>
-              <button type="submit" class="primaryAction">Save rule</button>
-            </form>
+                <button type="submit">Filter</button>
+                <button type="button" id="alertsClearButton">Clear</button>
+              </form>
 
-            <div class="tableWrap">
-              <h3>Alert rules</h3>
-              <table>
-                <thead>
-                  <tr>
-                    <th>Name</th>
-                    <th>Kind</th>
-                    <th>Threshold</th>
-                    <th>Cooldown</th>
-                    <th>Params</th>
-                    <th>Enabled</th>
-                    <th>Created</th>
-                  </tr>
-                </thead>
-                <tbody id="alertRulesRows"></tbody>
-              </table>
-            </div>
+              <form class="alertRuleForm" id="createAlertRuleForm">
+                <label>
+                  Rule name
+                  <input id="alertRuleName" required placeholder="e.g. High-value keyword" />
+                </label>
+                <label>
+                  Kind
+                  <select id="alertRuleKind" required>
+                    <option value="keyword">keyword</option>
+                    <option value="stale_pending">stale_pending</option>
+                    <option value="no_movement">no_movement</option>
+                  </select>
+                </label>
+                <label>
+                  Threshold minutes
+                  <input id="alertRuleThreshold" type="number" min="1" placeholder="60" />
+                </label>
+                <label>
+                  Cooldown minutes
+                  <input id="alertRuleCooldown" type="number" min="1" placeholder="30" />
+                </label>
+                <label>
+                  Keyword
+                  <input id="alertRuleKeyword" placeholder="Required for keyword rules" />
+                </label>
+                <button type="submit" class="primaryAction">Save rule</button>
+              </form>
 
-            <div class="tableWrap">
-              <h3>Active alerts</h3>
-              <table>
-                <thead>
-                  <tr>
-                    <th>Time</th>
-                    <th>Severity</th>
-                    <th>Rule</th>
-                    <th>Entity</th>
-                    <th>Entity ID</th>
-                    <th>Title</th>
-                    <th>Details</th>
-                    <th>Action</th>
-                  </tr>
-                </thead>
-                <tbody id="alertsRows"></tbody>
-              </table>
-            </div>
+              <div class="tableWrap">
+                <h3>Alert rules</h3>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Kind</th>
+                      <th>Threshold</th>
+                      <th>Cooldown</th>
+                      <th>Params</th>
+                      <th>Enabled</th>
+                      <th>Created</th>
+                    </tr>
+                  </thead>
+                  <tbody id="alertRulesRows"></tbody>
+                </table>
+              </div>
 
-            <footer class="pager">
-              <button id="alertsPrevButton" type="button">Previous</button>
-              <span id="alertsPageInfo">0 alerts</span>
-              <button id="alertsNextButton" type="button">Next</button>
-            </footer>
+              <div class="tableWrap">
+                <h3>Active alerts</h3>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Time</th>
+                      <th>Severity</th>
+                      <th>Rule</th>
+                      <th>Entity</th>
+                      <th>Entity ID</th>
+                      <th>Title</th>
+                      <th>Details</th>
+                      <th>Action</th>
+                    </tr>
+                  </thead>
+                  <tbody id="alertsRows"></tbody>
+                </table>
+              </div>
+
+              <footer class="pager">
+                <button id="alertsPrevButton" type="button">Previous</button>
+                <span id="alertsPageInfo">0 alerts</span>
+                <button id="alertsNextButton" type="button">Next</button>
+              </footer>
+            </section>
           </section>
         </section>
       </section>
     </main>
+    <div id="toastViewport" class="toastViewport" aria-live="polite" aria-atomic="false"></div>
 
     <script src="/app.js"></script>
   </body>

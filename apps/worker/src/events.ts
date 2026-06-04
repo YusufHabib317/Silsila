@@ -19,6 +19,17 @@ export type WaEvent =
       mediaType: string
       storageStatus: string
     }
+  | {
+      type: 'qr'
+      accountId: string
+      qr: string
+      createdAt: string
+    }
+  | {
+      type: 'connection'
+      accountId: string
+      status: 'connected' | 'disconnected' | string
+    }
 
 export async function publishEvent(event: WaEvent): Promise<void> {
   try {

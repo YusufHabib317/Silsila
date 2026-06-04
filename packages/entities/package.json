@@ -7,7 +7,8 @@
   "scripts": {
     "migration:run": "typeorm-ts-node-commonjs migration:run -d src/data-source.ts",
     "migration:revert": "typeorm-ts-node-commonjs migration:revert -d src/data-source.ts",
-    "migration:generate": "typeorm-ts-node-commonjs migration:generate -d src/data-source.ts"
+    "migration:generate": "typeorm-ts-node-commonjs migration:generate -d src/data-source.ts",
+    "schema:reset": "ts-node src/reset-schema.ts"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.1.0",

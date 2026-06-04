@@ -10,12 +10,14 @@
   "dependencies": {
     "@wa/entities": "workspace:*",
     "@wa/storage": "workspace:*",
-    "ioredis": "^5.4.1",
     "dotenv": "^16.4.5",
+    "ioredis": "^5.4.1",
+    "qrcode": "1.5.4",
     "reflect-metadata": "^0.2.2"
   },
   "devDependencies": {
     "@types/node": "^20.12.0",
+    "@types/qrcode": "1.5.5",
     "ts-node": "^10.9.2",
     "typescript": "^5.4.5"
   }

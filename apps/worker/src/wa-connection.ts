@@ -1,10 +1,10 @@
 import makeWASocket, {
   DisconnectReason,
+  type BaileysEventMap,
   fetchLatestBaileysVersion,
   proto,
   WASocket,
 } from 'baileys'
-import qrcode from 'qrcode-terminal'
 import { DataSource } from 'typeorm'
 import { Account } from '@wa/entities'
 import { useDbAuthState } from './db-auth-state'
@@ -93,24 +93,33 @@ export class WaConnection {
     }
   }
 
-  private async onConnectionUpdate(update: any): Promise<void> {
+  private async onConnectionUpdate(update: BaileysEventMap['connection.update']): Promise<void> {
     const { connection, lastDisconnect, qr } = update
 
     if (qr) {
       logger.info(`[${this.sessionId}] scan this QR (phone > Linked devices):`)
-      qrcode.generate(qr, { small: true })
+      await publishEvent({
+        type: 'qr',
+        accountId: this.sessionId,
+        qr,
+        createdAt: new Date().toISOString(),
+      })
     }
 
     if (connection === 'open') {
       this.reconnectAttempts = 0
       logger.info(`[${this.sessionId}] connected`)
+      await publishEvent({ type: 'connection', accountId: this.sessionId, status: 'connected' })
       await this.markSession('connected')
     }
 
     if (connection === 'close') {
       socketRegistry.unregister(this.sessionId, this.sock)
+      await publishEvent({ type: 'connection', accountId: this.sessionId, status: 'disconnected' })
       await this.markSession('disconnected')
-      const statusCode = lastDisconnect?.error?.output?.statusCode
+      const statusCode =
+        (lastDisconnect?.error as { output?: { statusCode?: number } } | undefined)?.output?.statusCode ??
+        null
 
       // Logged out = the session is dead. Reconnecting would loop forever;
       // a human must re-pair with a fresh QR.
@@ -159,7 +168,7 @@ export class WaConnection {
     }, delay)
   }
 
-  private logMessage(msg: any): void {
+  private logMessage(msg: proto.IWebMessageInfo): void {
     const from = msg.key?.remoteJid
     const fromMe = msg.key?.fromMe
     const kind = Object.keys(msg.message ?? {})[0] ?? 'unknown'
